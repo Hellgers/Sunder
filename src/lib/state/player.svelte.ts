@@ -484,20 +484,47 @@ class PlayerState {
     return null;
   }
 
-  removeFromQueue(index: number) {
+  removeFromQueue(index: number): void {
     this.queueEpoch++;
     const removedId = this.queue[index]?.id;
     const updated = [...this.queue];
     updated.splice(index, 1);
     this.queue = updated;
-    // Removing the current track keeps the chain: the track plays out, and the
-    // context resyncs on the next advance.
+
     if (index === this.queueIndex) {
-      if (this.queueIndex >= this.queue.length) {
+      // Removing the CURRENT track. Three cases, deliberately distinct:
+      //
+      // 1. TRACKS AFTER IT: the state re-points to queue[queueIndex] (the old
+      //    next track) right here, and the async skipFromQueue() companion
+      //    loads it through the bridge's playNext(true) path - same skip the
+      //    Next button uses, so the lazy-context fallback still works. The
+      //    old song does NOT keep playing; UI and audio move together.
+      // 2. IT WAS THE LAST TRACK (nothing after it, but other rows remain):
+      //    mainstream players keep the removed-but-still-audible song until
+      //    it actually ends, then stop - so queueIndex clamps to the new end
+      //    and currentTrack stays as-is (single source of truth: the audible
+      //    audio). Nothing is loaded over it.
+      // 3. IT WAS THE ONLY TRACK: the queue is now empty - stop cleanly via
+      //    stopFromQueue() (backend stop + currentTrack null + idle).
+      if (this.queue.length === 0) {
+        this.queueIndex = -1;
+        this.currentTrack = null;
+        this.playbackState = "idle";
+        void this.stopFromQueue();
+        return;
+      }
+      if (index < this.queue.length) {
+        // Case 1: a next track exists at the same slot after removal.
+        const next = this.queue[index];
+        this.currentTrack = next;
+        void this.skipFromQueue();
+      } else {
+        // Case 2: last track - clamp, keep playing out, stop at end.
         this.queueIndex = this.queue.length - 1;
       }
       return;
     }
+
     if (index < this.queueIndex) {
       this.queueIndex--;
     }
@@ -511,6 +538,19 @@ class PlayerState {
       }
     }
   }
+
+  /**
+   * Async companion to removeFromQueue's case 1: load the track that now sits
+   * at queueIndex through the bridge's skip path (playNext(true) semantics),
+   * so the lazy playlist context fallback resolves it exactly like the Next
+   * button does. Injectable for dev harnesses.
+   */
+  skipFromQueue: () => Promise<void> = async () => {};
+
+  /** Stop cleanly after the queue empties: backend stop + currentTrack null
+   * + idle, routed through the bridge like every other stop. Injectable for
+   * dev harnesses. */
+  stopFromQueue: () => Promise<void> = async () => {};
 
   shuffle() {
     this.queueEpoch++;
@@ -680,6 +720,17 @@ function formatTime(secs: number): string {
 }
 
 export const player = new PlayerState();
+
+// Default companions for removeFromQueue's current-removal cases. Defined
+// after the singleton (they close over it) and routed through the bridge so
+// the skip uses playNext(true) semantics - lazy playlist context fallback
+// included - and the stop clears currentTrack + state exactly like the
+// transport's stop.
+player.skipFromQueue = async () => {
+  const { playNext } = await import("../ipc/bridge");
+  await playNext(true);
+};
+player.stopFromQueue = () => stop();
 
 // Persist the context whenever any part of it changes (index moves on every
 // advance, order changes on shuffle/removals). Same $effect.root pattern as

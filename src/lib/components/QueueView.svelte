@@ -22,7 +22,15 @@
   let queue = $derived(player.queue);
   let currentIndex = $derived(player.queueIndex);
 
-  let nowPlaying = $derived(currentIndex >= 0 && currentIndex < queue.length ? queue[currentIndex] : null);
+  // The card mirrors the AUDIO, not the array slot. Normal operation: they
+  // are the same track. After the play-to-end removal (current/last track
+  // removed, still audible until it ends) the track is no longer in the
+  // queue array - player.currentTrack keeps it visible until the audio ends.
+  let nowPlaying = $derived.by(() => {
+    if (player.currentTrack) return player.currentTrack;
+    if (currentIndex >= 0 && currentIndex < queue.length) return queue[currentIndex];
+    return null;
+  });
   let upNext = $derived(queue.slice(currentIndex + 1));
   let played = $derived(currentIndex > 0 ? queue.slice(0, currentIndex) : []);
 
