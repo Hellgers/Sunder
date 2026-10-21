@@ -1,0 +1,26 @@
+{
+  "musicTwoRowItemRenderer": {
+    "title": {
+      "runs": [{
+        "text": "Synthetic Saved Episodes",
+        "navigationEndpoint": {
+          "browseEndpoint": {
+            "browseId": "VLSE",
+            "browseEndpointContextSupportedConfigs": {
+              "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_PLAYLIST" }
+            }
+          }
+        }
+      }]
+    },
+    "thumbnailOverlay": {
+      "musicItemThumbnailOverlayRenderer": {
+        "content": {
+          "musicPlayButtonRenderer": {
+            "playNavigationEndpoint": { "watchPlaylistEndpoint": { "playlistId": "SE" } }
+          }
+        }
+      }
+    }
+  }
+}

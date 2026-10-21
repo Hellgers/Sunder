@@ -1,0 +1,16 @@
+{
+  "musicResponsiveHeaderRenderer": {
+    "title": { "runs": [{ "text": "Synthetic Saved Episodes" }] },
+    "secondSubtitle": { "runs": [{ "text": "0 episodes" }] }
+  },
+  "musicPlaylistShelfRenderer": {
+    "collapsedItemCount": 0,
+    "contentsMultiSelectable": true,
+    "contentsReorderable": true,
+    "emptyState": { "messageRenderer": { "subtext": { "runs": [{ "text": "Synthetic empty state" }] }, "style": "MESSAGE_RENDERER_STYLE_DEFAULT" } },
+    "header": {},
+    "playlistId": "SE",
+    "targetId": "synthetic-playlist-shelf",
+    "trackingParams": "synthetic"
+  }
+}

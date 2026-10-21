@@ -40,6 +40,36 @@ impl PlaylistCollector {
                 "YouTube Music playlist layout changed; refusing to claim a full import".into(),
             );
         };
+        // A verified zero-episode playlist uses an explicit empty-state message
+        // and omits contents entirely. Do not treat arbitrary unknown rows as empty.
+        if self.entry.source_id == "SE"
+            && self.entry.expected_count == Some(0)
+            && container.get("contents").is_none()
+            && container
+                .get("emptyState")
+                .and_then(Value::as_object)
+                .is_some_and(|empty| {
+                    empty.len() == 1 && empty.get("messageRenderer").is_some_and(Value::is_object)
+                })
+            && container.as_object().is_some_and(|object| {
+                object.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "collapsedItemCount"
+                            | "contentsMultiSelectable"
+                            | "contentsReorderable"
+                            | "emptyState"
+                            | "header"
+                            | "playlistId"
+                            | "targetId"
+                            | "trackingParams"
+                    )
+                })
+            })
+            && continuation(container).is_none()
+        {
+            return Ok(None);
+        }
         let (rows, unknown) = playlist_rows(container, &self.entry.source_id, self.tracks.len());
         if unknown > 0 {
             self.complete = false;
@@ -194,7 +224,14 @@ fn library_entry(item: &Value) -> Result<Option<LibraryEntry>, ()> {
     if source_id == "LM" {
         return Ok(None);
     }
-    if !(source_id.starts_with("PL")
+    // Saved Episodes is a real system playlist, like LM, rather than an
+    // unsupported utility tile. The current library card identifies it as SE
+    // with an explicit playlist page type; keep unknown short IDs fail-closed.
+    let saved_episodes = source_id == "SE"
+        && endpoint.pointer("/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+            .and_then(Value::as_str) == Some("MUSIC_PAGE_TYPE_PLAYLIST");
+    if !(saved_episodes
+        || source_id.starts_with("PL")
         || source_id.starts_with("OLAK")
         || source_id.starts_with("RD"))
     {
@@ -405,6 +442,10 @@ pub fn expected_count(response: &Value) -> Option<usize> {
                 if let Some(number) = label
                     .strip_suffix(" songs")
                     .or_else(|| label.strip_suffix(" song"))
+                    .or_else(|| label.strip_suffix(" episodes"))
+                    .or_else(|| label.strip_suffix(" episode"))
+                    .or_else(|| label.strip_suffix(" tracks"))
+                    .or_else(|| label.strip_suffix(" track"))
                 {
                     let digits = number.replace([',', ' '], "");
                     if let Ok(result) = digits.parse() {
@@ -670,6 +711,126 @@ mod tests {
         assert_eq!(entries[0].source_id, "PLactual");
         assert_eq!(entries[0].title, "A playlist");
         assert_eq!(unknown_library_rows(&container), 1);
+    }
+
+    #[test]
+    fn saved_episodes_is_inventory_not_an_unknown_or_silently_skipped_card() {
+        let saved: Value =
+            serde_json::from_str(include_str!("fixtures/library_saved_episodes.json")).unwrap();
+        let mut items = vec![
+            json!({"musicCreatePlaylistButtonRenderer":{}}),
+            json!({"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Liked Music","navigationEndpoint":{"browseEndpoint":{"browseId":"VLLM"}}}]}}}),
+        ];
+        for index in 0..13 {
+            items.push(json!({"musicTwoRowItemRenderer":{"title":{"runs":[{"text":"Synthetic playlist","navigationEndpoint":{"browseEndpoint":{"browseId":format!("VLPLfixture{index}")}}}]}}}));
+        }
+        items.push(saved.clone());
+        let page = json!({"items":items});
+        let entries = library_entries(&page);
+        assert_eq!(
+            entries.len(),
+            14,
+            "all 13 owned/saved playlists and SE must survive"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.source_id == "SE")
+                .count(),
+            1
+        );
+        assert_eq!(unknown_library_rows(&page), 0);
+        assert!(continuation(&page).is_none());
+        let mut unknown = saved.clone();
+        unknown["musicTwoRowItemRenderer"]["title"]["runs"][0]["navigationEndpoint"]
+            ["browseEndpoint"]["browseId"] = json!("VLXY");
+        assert_eq!(unknown_library_rows(&json!({"items":[unknown]})), 1);
+        let mut wrong_page = saved;
+        wrong_page["musicTwoRowItemRenderer"]["title"]["runs"][0]["navigationEndpoint"]
+            ["browseEndpoint"]["browseEndpointContextSupportedConfigs"]
+            ["browseEndpointContextMusicConfig"]["pageType"] = json!("MUSIC_PAGE_TYPE_ALBUM");
+        assert_eq!(unknown_library_rows(&json!({"items":[wrong_page]})), 1);
+    }
+
+    #[test]
+    fn saved_episode_counts_are_exact_and_an_empty_verified_playlist_is_complete() {
+        for (label, count) in [
+            ("0 episodes", Some(0)),
+            ("1 episode", Some(1)),
+            ("1,234 episodes", Some(1234)),
+            ("5K episodes", None),
+        ] {
+            assert_eq!(
+                expected_count(
+                    &json!({"musicResponsiveHeaderRenderer":{"subtitle":{"runs":[{"text":label}]}}})
+                ),
+                count
+            );
+        }
+        let entry = LibraryEntry {
+            source_id: "SE".into(),
+            title: "Saved Episodes".into(),
+            thumbnail: String::new(),
+            expected_count: None,
+        };
+        let mut collector = PlaylistCollector::new(entry);
+        assert!(collector.consume(&json!({"musicResponsiveHeaderRenderer":{"subtitle":{"runs":[{"text":"0 episodes"}]}}})).unwrap().is_none());
+        let playlist = collector.finish();
+        assert!(playlist.complete);
+        assert_eq!(playlist.source.expected_count, Some(0));
+        assert!(playlist.tracks.is_empty());
+    }
+
+    #[test]
+    fn current_zero_episode_empty_shelf_is_complete_but_unknown_zero_count_rows_are_not() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/empty_saved_episodes.json")).unwrap();
+        let source = LibraryEntry {
+            source_id: "SE".into(),
+            title: String::new(),
+            thumbnail: String::new(),
+            expected_count: None,
+        };
+        let mut state = PlaylistCollector::new(source.clone());
+        assert!(state.consume(&fixture).unwrap().is_none());
+        let result = state.finish();
+        assert!(result.complete);
+        assert_eq!(result.source.expected_count, Some(0));
+        assert!(result.warnings.is_empty());
+        for (key, value) in [
+            ("contents", json!([{"newUnknownRenderer":{}}])),
+            ("newRows", json!([{}])),
+        ] {
+            let mut unknown = fixture.clone();
+            unknown["musicPlaylistShelfRenderer"][key] = value;
+            let mut state = PlaylistCollector::new(source.clone());
+            state.consume(&unknown).unwrap();
+            assert!(
+                !state.finish().complete,
+                "zero count must not hide unknown rows"
+            );
+        }
+        let mut unknown = fixture;
+        unknown["musicPlaylistShelfRenderer"]["emptyState"] = json!({"newEmptyRenderer":{}});
+        let mut state = PlaylistCollector::new(source);
+        state.consume(&unknown).unwrap();
+        assert!(!state.finish().complete);
+    }
+
+    #[test]
+    fn current_tracks_label_is_an_exact_playlist_count() {
+        assert_eq!(
+            expected_count(
+                &json!({"musicResponsiveHeaderRenderer":{"secondSubtitle":{"runs":[{"text":"29 tracks"}]}}})
+            ),
+            Some(29)
+        );
+        assert_eq!(
+            expected_count(
+                &json!({"musicResponsiveHeaderRenderer":{"secondSubtitle":{"runs":[{"text":"5K tracks"}]}}})
+            ),
+            None
+        );
     }
 
     #[test]

@@ -213,6 +213,7 @@ impl YouTubeMusic {
             || browse_id.starts_with("OLAK")
             || browse_id.starts_with("RD")
             || browse_id == "LM"
+            || browse_id == "SE"
             || browse_id.starts_with("VL")
         {
             let playlist = self
