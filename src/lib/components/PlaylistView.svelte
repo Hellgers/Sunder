@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { isPlayable, playableIndex } from "../util/tracks";
   import { onMount } from "svelte";
   import {
     listPlaylists,
+    ytmusicImportedPlaylistIds,
     createPlaylist,
     deletePlaylist,
     getPlaylistTracks,
@@ -30,6 +32,8 @@
 
   let ctxMenu: ReturnType<typeof ContextMenu>;
 
+  let importedIds = $state<number[]>([]);
+  let readOnly = $derived(nav.activePlaylistId !== null && importedIds.includes(nav.activePlaylistId));
   let playlists = $state<Playlist[]>([]);
   let detailTracks = $state<Track[]>([]);
   let trackFilter = $state("");
@@ -70,7 +74,7 @@
 
   async function refreshPlaylists() {
     try {
-      playlists = await listPlaylists();
+      [playlists, importedIds] = await Promise.all([listPlaylists(), ytmusicImportedPlaylistIds()]);
     } catch (e) {
       console.error("list playlists:", e);
     }
@@ -142,7 +146,7 @@
 
   let refreshing = $state(false);
   async function handleRefresh() {
-    if (nav.activePlaylistId === null || refreshing) return;
+    if (readOnly || nav.activePlaylistId === null || refreshing) return;
     refreshing = true;
     try {
       const count = await refreshYtPlaylist(nav.activePlaylistId);
@@ -218,7 +222,8 @@
   }
 
   async function handleRemove(trackId: string) {
-    if (nav.activePlaylistId === null) return;
+    if (readOnly || nav.activePlaylistId === null) return;
+    if (detailTracks.filter(t => t.id === trackId).length > 1) { toastState.add("Repeated tracks require positional editing; removal cancelled", "info"); return; }
     try {
       await removeFromPlaylist(nav.activePlaylistId, trackId);
       detailTracks = detailTracks.filter((t) => t.id !== trackId);
@@ -227,33 +232,13 @@
     }
   }
 
-  async function handlePlay(track: Track) {
-    if (reorder.dragging || reorder.justDragged()) return;
-    // Clicking a track here starts PLAYBACK CONTEXT, not a single play
-    // (issue #44): the playlist continues from the clicked position, and the
-    // rest of it is resolved lazily instead of being materialized at once.
-    const pid = nav.activePlaylistId;
-    if (pid !== null) {
-      const order = detailTracks.map((t) => t.id);
-      const index = order.indexOf(track.id);
-      if (index !== -1) {
-        const started = await player.playFromPlaylist(
-          pid,
-          nav.activePlaylistName ?? "",
-          order,
-          index,
-        );
-        if (started) {
-          await playTrack(started);
-          return;
-        }
-      }
-    }
+  async function handlePlay(track: Track, index: number) {
+    if (!isPlayable(track) || reorder.dragging || reorder.justDragged()) return;
     try {
-      await playTrack(track);
-    } catch (e) {
-      console.error("play:", e);
-    }
+      player.setQueue(detailTracks);
+      const started = player.playFromQueue(index);
+      if (started) await playTrack(started);
+    } catch (e) { toastState.add(`Play failed: ${e}`, "error"); }
   }
 
   function formatDuration(secs: number): string {
@@ -263,8 +248,8 @@
     return `${m}:${s.toString().padStart(2, "0")}`;
   }
 
-  function isActive(track: Track): boolean {
-    return player.currentTrack?.id === track.id;
+  function isActive(track: Track, index: number): boolean {
+    return player.currentTrack?.id === track.id && player.queueIndex === index;
   }
 
   let showPlayAllMenu = $state(false);
@@ -273,13 +258,7 @@
   async function playNow(tracks: Track[]) {
     if (tracks.length === 0) return;
     player.setQueue(tracks);
-    // Explicit Play All still materializes (user asked for it), but rides the
-    // same context chain so the chip and advance semantics stay consistent.
-    const pid = nav.activePlaylistId;
-    if (pid !== null) {
-      player.attachContext(pid, nav.activePlaylistName ?? "", tracks.map((t) => t.id), 0);
-    }
-    const first = player.playFromQueue(0);
+    const first = player.playFromQueue(playableIndex(tracks, 0, 1));
     if (first) await playTrack(first);
   }
 
@@ -319,7 +298,7 @@
   function handleDownloadAll() {
     if (nav.activePlaylistId === null || detailTracks.length === 0) return;
     const id = nav.activePlaylistId;
-    downloads.register(detailTracks);
+    downloads.register(detailTracks.filter(isPlayable));
     downloadPlaylist(id).catch(() => {
       // per-track failures surface in the activity panel
     });
@@ -330,10 +309,7 @@
       const tracks = await getPlaylistTracks(p.id);
       if (tracks.length === 0) return;
       player.setQueue(tracks);
-      // Quick play from the card = Play All semantics: materialized queue
-      // riding the same context chain (issue #44).
-      player.attachContext(p.id, p.name, tracks.map((t) => t.id), 0);
-      const first = player.playFromQueue(0);
+      const first = player.playFromQueue(playableIndex(tracks, 0, 1));
       if (first) await playTrack(first);
     } catch (e) {
       console.error("quick play:", e);
@@ -390,7 +366,7 @@
     },
     getScrollContainer: () => document.querySelector(".content") as HTMLElement | null,
     rowSelector: ".drag-row",
-    disabled: () => filterActive,
+    disabled: () => readOnly || filterActive || new Set(detailTracks.map(t => t.id)).size !== detailTracks.length,
   });
 
   onMount(() => () => {
@@ -399,7 +375,7 @@
   });
 </script>
 
-<ContextMenu bind:this={ctxMenu} onRemoveFromPlaylist={(id) => { detailTracks = detailTracks.filter((t) => t.id !== id); }} />
+<ContextMenu readOnly={readOnly || new Set(detailTracks.map(t => t.id)).size !== detailTracks.length} bind:this={ctxMenu} onRemoveFromPlaylist={(id) => { detailTracks = detailTracks.filter((t) => t.id !== id); }} />
 <DragGhost {reorder} />
 
 {#if viewing}
@@ -470,14 +446,14 @@
           </svg>
           Export
         </button>
-        <button class="export-btn ai-btn" onclick={() => (showAiSuggest = true)} aria-label="Ask AI for song suggestions">
+        <button disabled={readOnly} class="export-btn ai-btn" onclick={() => (showAiSuggest = true)} aria-label="Ask AI for song suggestions">
           <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
             <path d="M12 2l1.9 5.7L19.5 9l-5.6 1.9L12 16l-1.9-5.1L4.5 9l5.6-1.3L12 2z" />
             <path d="M19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9L19 14z" />
           </svg>
           Ask AI
         </button>
-        <button class="export-btn" onclick={handleRefresh} disabled={refreshing} aria-label="Refresh playlist from source">
+        <button class="export-btn" onclick={handleRefresh} disabled={refreshing || readOnly} aria-label="Refresh playlist from source">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="23 4 23 10 17 10" />
             <polyline points="1 20 1 14 7 14" />
@@ -488,7 +464,8 @@
       {/if}
     </div>
 
-    {#if detailTracks.length === 0}
+    {#if readOnly}<p class="import-note">Imported snapshot: order, duplicates and unavailable entries are preserved. Re-import from YouTube account to update.</p>{/if}
+  {#if detailTracks.length === 0}
       <p class="empty-sub">No tracks yet. Add tracks from search results.</p>
     {:else}
       <div class="search-row">
@@ -525,11 +502,11 @@
         <p class="empty-sub">No tracks match "{trackFilter}".</p>
       {:else}
       <div class="track-list">
-        {#each filteredTracks as { track, originalIndex } (track.id)}
+        {#each filteredTracks as { track, originalIndex } (originalIndex)}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="track-row drag-row"
-            class:active={isActive(track)}
+            class="track-row drag-row" class:unavailable={!isPlayable(track)}
+            class:active={isActive(track, originalIndex)}
             class:filter-locked={filterActive}
             class:is-dragging={reorder.isDragging(originalIndex)}
             class:drop-before={reorder.dragOver === originalIndex && reorder.dropPosition === "before" && reorder.dragFrom !== originalIndex}
@@ -540,19 +517,19 @@
             onpointercancel={() => reorder.onPointerCancel()}
             oncontextmenu={(e) => ctxMenu.open(e, track)}
           >
-            <span class="drag-handle" aria-hidden="true" class:disabled={filterActive} title={filterActive ? "Reordering disabled while filtering. Clear the filter to reorder" : "Drag to reorder"}>
+            <span class="drag-handle" aria-hidden="true" class:disabled={filterActive || readOnly} title={filterActive ? "Reordering disabled while filtering. Clear the filter to reorder" : "Drag to reorder"}>
               <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg>
             </span>
             <span class="track-num">{originalIndex + 1}</span>
-            <TrackArt {track} onplay={handlePlay} active={isActive(track)} playing={player.isPlaying} size={44} />
-            <button class="track-play" onclick={() => handlePlay(track)}>
+            <TrackArt {track} onplay={(t) => handlePlay(t, originalIndex)} active={isActive(track, originalIndex)} playing={player.isPlaying} size={44} />
+            <button class="track-play" disabled={!isPlayable(track)} onclick={() => handlePlay(track, originalIndex)}>
               <div class="track-info">
                 <span class="track-title">{track.title}</span>
-                <span class="track-artist">{track.artist}</span>
+                <span class="track-artist">{isPlayable(track) ? track.artist : "Unavailable - preserved in playlist"}</span>
               </div>
               <span class="track-duration">{formatDuration(track.duration_secs)}</span>
             </button>
-            <button class="remove-btn drag-skip" onclick={() => handleRemove(track.id)} aria-label="Remove">
+            <button disabled={readOnly} class="remove-btn drag-skip" onclick={() => handleRemove(track.id)} aria-label="Remove">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <line x1="18" y1="6" x2="6" y2="18" />
                 <line x1="6" y1="6" x2="18" y2="18" />
@@ -673,6 +650,7 @@
 {/if}
 
 <style>
+  .unavailable { opacity: .45; }
   .create-row {
     display: flex;
     gap: 8px;

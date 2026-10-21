@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isPlayable } from "../util/tracks";
   import { downloads } from "../state/downloads.svelte";
   import { downloadTrack, deleteDownload } from "../ipc/bridge";
   import type { Track } from "../types";
@@ -27,7 +28,7 @@
   async function handleClick(e: MouseEvent) {
     e.stopPropagation();
     e.preventDefault();
-    if (active) return;
+    if (active || !isPlayable(track)) return;
     try {
       if (downloaded) {
         await deleteDownload(track.id);
@@ -42,6 +43,7 @@
 </script>
 
 <button
+  disabled={!isPlayable(track)}
   class="dl-btn"
   class:downloaded
   class:active

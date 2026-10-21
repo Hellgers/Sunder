@@ -176,7 +176,7 @@
     </div>
   {:else}
     <div class="track-list">
-      {#each tracks as track, i (track.id)}
+      {#each tracks as track, i (i)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="track-row drag-row"

@@ -1,19 +1,16 @@
 use std::ffi::c_void;
-use std::io::{self, BufRead, Read};
+use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use rodio::mixer::Mixer;
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig, SeekDirection,
 };
 use tauri::{Emitter, Manager};
-
-use crate::process::NoWindow;
 
 /// Wrapper to send a raw HWND pointer across threads.
 /// SAFETY: The HWND outlives the audio thread (it's the main window).
@@ -33,6 +30,7 @@ pub enum AudioCommand {
         duration_ms: u64,
     },
     Prepared {
+        clock: Option<Arc<super::stream::StreamClock>>,
         session_id: usize,
         sink: rodio::Player,
         duration_ms: u64,
@@ -145,7 +143,7 @@ impl AudioHandle {
             use tauri::Manager;
             app.get_webview_window("main")
                 .and_then(|w| w.hwnd().ok())
-                .map(|h| RawHwnd(h.0 as *mut c_void))
+                .map(|h| RawHwnd(h.0))
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -153,10 +151,6 @@ impl AudioHandle {
             None
         }
     }
-}
-
-fn ytdlp_bin(app: &tauri::AppHandle) -> String {
-    crate::extraction::ytdlp::resolve_bin_for(app)
 }
 
 /// Snapshot the current source position from the epoch tracker.
@@ -196,6 +190,7 @@ fn relative_seek_target_ms(
 /// Which route the acquisition ladder selected. Returned alongside the sink so
 /// callers and tests can tell the fallback rungs apart (issue #43).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum AudioRoute {
     /// cpal's native PipeWire host.
     PipeWire,
@@ -252,16 +247,13 @@ fn open_output_by_route() -> Result<(AudioRoute, MixerDeviceSink, Mixer), String
     if let Ok(devices) = alsa_host.devices() {
         // description().driver() is the PCM id; matching on it avoids opening
         // devices during the scan (cpal 0.18 deliberately defers opens).
-        if let Some(pulse_dev) = devices
-            .into_iter()
-            .find(|d| {
-                d.description()
-                    .ok()
-                    .and_then(|desc| desc.driver().map(|s| s.to_string()))
-                    .as_deref()
-                    == Some("pulse")
-            })
-        {
+        if let Some(pulse_dev) = devices.into_iter().find(|d| {
+            d.description()
+                .ok()
+                .and_then(|desc| desc.driver().map(|s| s.to_string()))
+                .as_deref()
+                == Some("pulse")
+        }) {
             match DeviceSinkBuilder::from_device(pulse_dev).and_then(|b| b.open_stream()) {
                 Ok(sink) => {
                     let mixer = sink.mixer().clone();
@@ -382,30 +374,24 @@ struct RecoveryContext<'a> {
 }
 
 /// Outcome of a rebuild+replay attempt. Lets the caller distinguish a
-/// successful replay schedule from cache-cold / no-replay-id / device-fatal
+/// successful replay schedule from no-replay-id / device-fatal
 /// so it can mirror LoadFailed semantics on the failure paths (BLOCKER fix).
 enum RebuildOutcome {
     /// start_streaming thread spawned, or was_playing=false so no replay needed.
     ReplayScheduled,
     /// was_playing=true but no replay_id present (defensive; shouldn't happen).
     ReplaySkipped,
-    /// was_playing=true + replay_id present + neither temp cache nor offline
-    /// download exists. Caller should mirror LoadFailed.
-    CacheCold,
     /// OutputStream::try_default failed. Helper already emitted audio-device-lost
     /// before returning; caller preserves that NoDevice state.
     StreamFatal,
 }
 
 /// Underrun recovery: freeze epoch at the live speed, drop sink+stream,
-/// rebuild via system default. On CacheCold/ReplaySkipped/StreamFatal: mirror
+/// rebuild via system default. On ReplaySkipped/StreamFatal: mirror
 /// the LoadFailed arm (set state=Idle, clear active_id, emit playback-error).
-fn attempt_underrun_recovery(ctx: &mut RecoveryContext<'_>, epoch_speed: f32) -> RebuildOutcome {
+fn attempt_underrun_recovery(ctx: &mut RecoveryContext<'_>, _epoch_speed: f32) -> RebuildOutcome {
     let detected_at = chrono::Utc::now().to_rfc3339();
-    let snapshot_pos_ms = ctx.paused_pos_ms.unwrap_or_else(|| {
-        current_source_pos_ms(*ctx.epoch_source_ms, *ctx.epoch_start, epoch_speed)
-            .unwrap_or(*ctx.epoch_source_ms)
-    });
+    let snapshot_pos_ms = ctx.position_ms.load(Ordering::Acquire);
     *ctx.epoch_source_ms = snapshot_pos_ms;
     *ctx.epoch_start = None;
     *ctx.paused_pos_ms = Some(snapshot_pos_ms);
@@ -436,7 +422,7 @@ fn attempt_underrun_recovery(ctx: &mut RecoveryContext<'_>, epoch_speed: f32) ->
             );
             RebuildOutcome::ReplayScheduled
         }
-        RebuildOutcome::ReplaySkipped | RebuildOutcome::CacheCold => {
+        RebuildOutcome::ReplaySkipped => {
             *ctx.state.write().unwrap() = PlaybackState::Idle;
             let id_for_err = ctx.active_id.clone().unwrap_or_default();
             *ctx.active_id = None;
@@ -452,7 +438,7 @@ fn attempt_underrun_recovery(ctx: &mut RecoveryContext<'_>, epoch_speed: f32) ->
                 "playback-error",
                 serde_json::json!({
                     "video_id": id_for_err,
-                    "error": "underrun recovery failed (cache cold)",
+                    "error": "unable to resume this track",
                 }),
             );
             let _ = ctx.app.emit(
@@ -464,7 +450,7 @@ fn attempt_underrun_recovery(ctx: &mut RecoveryContext<'_>, epoch_speed: f32) ->
                     "recovery_kind": "underrun_failed",
                 }),
             );
-            RebuildOutcome::CacheCold
+            RebuildOutcome::ReplaySkipped
         }
         RebuildOutcome::StreamFatal => {
             // Helper already transitioned state to NoDevice (with transition
@@ -491,8 +477,7 @@ fn rebuild_stream_and_replay(
         s.stop();
     }
     drop(ctx._stream.take());
-    let new_stream_result: Result<(MixerDeviceSink, Mixer), String> =
-        acquire_output_stream();
+    let new_stream_result: Result<(MixerDeviceSink, Mixer), String> = acquire_output_stream();
     let (new_stream, new_stream_handle) = match new_stream_result {
         Ok(s) => s,
         Err(e) => {
@@ -552,18 +537,7 @@ fn rebuild_stream_and_replay(
         *ctx.stream_handle = None;
         return RebuildOutcome::ReplaySkipped;
     };
-    let cache_dir = std::env::temp_dir().join("sunder");
-    let expected_path = cache_dir.join(format!("{id}.mp3"));
-    let download_path =
-        crate::downloads::DownloadManager::dir_for(ctx.app).join(format!("{id}.mp3"));
-    if !expected_path.exists() && !download_path.exists() {
-        eprintln!("[sunder] rebuild_stream: cache cold for '{id}', skipping replay");
-        drop(ctx._stream.take());
-        *ctx.stream_handle = None;
-        return RebuildOutcome::CacheCold;
-    }
     let app_clone = ctx.app.clone();
-    let state_clone = ctx.state.clone();
     let eq_settings_clone = ctx.eq_settings.clone();
     let session_clone = ctx.current_session.clone();
     let tx_in = ctx.tx.clone();
@@ -585,21 +559,23 @@ fn rebuild_stream_and_replay(
             // process abort, which is the same outcome as the Play loader.
             let worker_result = catch_unwind(AssertUnwindSafe(|| {
                 match start_streaming(
-                    &id_for_thread,
-                    &state_clone,
+                    PlaybackRequest {
+                        video_id: &id_for_thread,
+                        current_session: &session_clone,
+                        session_id: snapshot_session,
+                        resume_ms: snapshot_pos_ms,
+                    },
                     &new_stream_handle,
                     &eq_settings_clone,
                     &app_clone,
-                    &session_clone,
-                    snapshot_session,
+                    &tx_in,
                 ) {
-                    Ok(new_sink) => {
-                        let _ = tx_in.send(AudioCommand::Prepared {
-                            session_id: snapshot_session,
-                            sink: new_sink,
-                            duration_ms: replay_dur,
-                            resume_ms: snapshot_pos_ms,
-                        });
+                    Ok(prepared) => {
+                        let _ = tx_in.send(prepared.into_command(
+                            snapshot_session,
+                            snapshot_pos_ms,
+                            replay_dur,
+                        ));
                     }
                     Err(e) => {
                         // Surface async failure via the same LoadFailed arm the
@@ -648,11 +624,8 @@ fn rebuild_stream_and_replay(
 /// helper; audio-device-restored emitted here), false on StreamFatal (state
 /// already transitioned to NoDevice by the inner helper; audio-device-lost
 /// already emitted by the inner helper with the transition guard).
-fn attempt_device_recovery(ctx: &mut RecoveryContext<'_>, epoch_speed: f32) -> bool {
-    let snapshot_pos_ms = ctx.paused_pos_ms.unwrap_or_else(|| {
-        current_source_pos_ms(*ctx.epoch_source_ms, *ctx.epoch_start, epoch_speed)
-            .unwrap_or(*ctx.epoch_source_ms)
-    });
+fn attempt_device_recovery(ctx: &mut RecoveryContext<'_>, _epoch_speed: f32) -> bool {
+    let snapshot_pos_ms = ctx.position_ms.load(Ordering::Acquire);
     let snapshot_session = ctx.current_session.load(Ordering::SeqCst);
     let replay_id_owned = ctx.active_id.clone();
     let was_playing = ctx.sink.is_some() && ctx.active_id.is_some();
@@ -669,19 +642,6 @@ fn attempt_device_recovery(ctx: &mut RecoveryContext<'_>, epoch_speed: f32) -> b
             // Rebuild succeeded; helper already set state to Idle and wrote
             // the new _stream + stream_handle. Emit restored (one-time signal
             // for the frontend to dismiss the persistent lost toast).
-            let _ = ctx.app.emit(
-                "audio-device-restored",
-                serde_json::json!({
-                    "device_name": None::<String>,
-                }),
-            );
-            true
-        }
-        RebuildOutcome::CacheCold => {
-            // Device IS recovered but cache is cold for the active track.
-            // Rebuild already set state to Idle and emitted playback-error.
-            // Emit restored so the frontend dismisses the lost toast; the
-            // user can pick another track via playback-error.
             let _ = ctx.app.emit(
                 "audio-device-restored",
                 serde_json::json!({
@@ -801,6 +761,8 @@ fn audio_thread(
     let mut epoch_source_ms: u64 = 0;
     let mut epoch_speed: f32 = 1.0;
     let mut paused_pos_ms: Option<u64> = None;
+    let mut active_clock: Option<Arc<super::stream::StreamClock>> = None;
+    let mut pause_requested = false;
 
     let mut active_fade: Option<ActiveFade> = None;
 
@@ -836,7 +798,12 @@ fn audio_thread(
                     }
 
                     let current_ms = paused_pos_ms.unwrap_or_else(|| {
-                        current_source_pos_ms(epoch_source_ms, epoch_start, epoch_speed)
+                        active_clock
+                            .as_ref()
+                            .map(|clock| clock.position_ms.load(Ordering::Acquire))
+                            .or_else(|| {
+                                current_source_pos_ms(epoch_source_ms, epoch_start, epoch_speed)
+                            })
                             .unwrap_or_else(|| position_ms.load(Ordering::Relaxed))
                     });
                     let target_ms = relative_seek_target_ms(
@@ -959,6 +926,8 @@ fn audio_thread(
                         }
                     }
                     active_fade = None;
+                    active_clock = None;
+                    pause_requested = false;
                     if let Some(s) = sink.take() {
                         let start_vol = s.volume();
                         for i in (0..FADE_STEPS).rev() {
@@ -978,7 +947,6 @@ fn audio_thread(
                     emit_state(&app, &state, &position_ms, &duration_ms, &volume, &speed);
 
                     let app_clone = app.clone();
-                    let state_clone = state.clone();
                     // stream_handle is Option<rodio::OutputStreamHandle>.
                     // After attempt_device_recovery succeeded (when needed),
                     // it is Some. On the non-NoDevice path it was initialized
@@ -1019,21 +987,19 @@ fn audio_thread(
                                     return;
                                 }
                                 match start_streaming(
-                                    &video_id_clone,
-                                    &state_clone,
+                                    PlaybackRequest {
+                                        video_id: &video_id_clone,
+                                        current_session: &session_clone,
+                                        session_id,
+                                        resume_ms: 0,
+                                    },
                                     &stream_handle_clone,
                                     &eq_settings_clone,
                                     &app_clone,
-                                    &session_clone,
-                                    session_id,
+                                    &tx_clone,
                                 ) {
-                                    Ok(new_sink) => {
-                                        let _ = tx_clone.send(AudioCommand::Prepared {
-                                            session_id,
-                                            sink: new_sink,
-                                            duration_ms: dur,
-                                            resume_ms: 0,
-                                        });
+                                    Ok(prepared) => {
+                                        let _ = tx_clone.send(prepared.into_command(session_id, 0, dur));
                                     }
                                     Err(e) => {
                                         let _ = tx_clone.send(AudioCommand::LoadFailed {
@@ -1071,6 +1037,7 @@ fn audio_thread(
                     }
                 }
                 AudioCommand::Prepared {
+                    clock,
                     session_id,
                     sink: new_sink,
                     duration_ms: dur,
@@ -1095,13 +1062,27 @@ fn audio_thread(
                         position_ms.store(resume_ms, Ordering::Release);
                         epoch_speed = *speed.read().unwrap();
                         new_sink.set_speed(epoch_speed);
+                        if pause_requested {
+                            new_sink.pause();
+                        } else {
+                            new_sink.play();
+                        }
                         sink = Some(new_sink);
-                        *state.write().unwrap() = PlaybackState::Playing;
+                        active_clock = clock;
+                        *state.write().unwrap() = if pause_requested {
+                            PlaybackState::Paused
+                        } else {
+                            PlaybackState::Playing
+                        };
                         epoch_source_ms = resume_ms;
-                        epoch_start = Some(Instant::now());
-                        paused_pos_ms = None;
+                        epoch_start = if pause_requested {
+                            None
+                        } else {
+                            Some(Instant::now())
+                        };
+                        paused_pos_ms = pause_requested.then_some(resume_ms);
 
-                        active_fade = Some(ActiveFade {
+                        active_fade = (!pause_requested).then_some(ActiveFade {
                             start_vol: 0.0,
                             target_vol: *volume.read().unwrap(),
                             steps_total: FADE_STEPS,
@@ -1118,6 +1099,10 @@ fn audio_thread(
                     error,
                 } => {
                     if session_id == current_session.load(Ordering::SeqCst) {
+                        if let Some(s) = sink.take() {
+                            s.stop();
+                        }
+                        active_clock = None;
                         *state.write().unwrap() = PlaybackState::Idle;
                         active_id = None;
                         drop(_stream.take());
@@ -1134,10 +1119,19 @@ fn audio_thread(
                     }
                 }
                 AudioCommand::Pause => {
+                    pause_requested = true;
+                    if sink.is_none() && active_id.is_some() {
+                        *state.write().unwrap() = PlaybackState::Paused;
+                        emit_state(&app, &state, &position_ms, &duration_ms, &volume, &speed);
+                    }
                     if let Some(ref s) = sink {
                         // Snapshot source position before pausing
-                        if let Some(pos) =
-                            current_source_pos_ms(epoch_source_ms, epoch_start, epoch_speed)
+                        if let Some(pos) = active_clock
+                            .as_ref()
+                            .map(|clock| clock.position_ms.load(Ordering::Acquire))
+                            .or_else(|| {
+                                current_source_pos_ms(epoch_source_ms, epoch_start, epoch_speed)
+                            })
                         {
                             paused_pos_ms = Some(pos);
                         }
@@ -1152,6 +1146,10 @@ fn audio_thread(
                     }
                 }
                 AudioCommand::Resume => {
+                    pause_requested = false;
+                    if sink.is_none() && active_id.is_some() {
+                        *state.write().unwrap() = PlaybackState::Buffering;
+                    }
                     if let Some(ref s) = sink {
                         s.play();
                         *state.write().unwrap() = PlaybackState::Playing;
@@ -1173,6 +1171,8 @@ fn audio_thread(
                 }
                 AudioCommand::Stop => {
                     current_session.fetch_add(1, Ordering::SeqCst);
+                    active_clock = None;
+                    pause_requested = false;
                     active_fade = None;
 
                     if let Some(s) = sink.take() {
@@ -1409,7 +1409,20 @@ fn audio_thread(
         let mut track_ended = false;
 
         // Compute current source position from epoch
-        let cur_source_ms = if let Some(pause_pos) = paused_pos_ms {
+        let cur_source_ms = if let Some(ref clock) = active_clock {
+            let buffering = clock.buffering.load(Ordering::Acquire);
+            let mut guard = state.write().unwrap();
+            if !pause_requested
+                && (*guard == PlaybackState::Playing || *guard == PlaybackState::Buffering)
+            {
+                *guard = if buffering {
+                    PlaybackState::Buffering
+                } else {
+                    PlaybackState::Playing
+                };
+            }
+            clock.position_ms.load(Ordering::Acquire)
+        } else if let Some(pause_pos) = paused_pos_ms {
             pause_pos
         } else if let Some(start) = epoch_start {
             let wall_ms = start.elapsed().as_millis() as u64;
@@ -1424,7 +1437,8 @@ fn audio_thread(
                 let dur = duration_ms.load(Ordering::Relaxed);
                 // Force completion if position far exceeds reported duration
                 // (guards against decoders that don't EOF cleanly)
-                if dur > 0
+                if active_clock.is_none()
+                    && dur > 0
                     && cur_source_ms > dur + 2000
                     && *state.read().unwrap() == PlaybackState::Playing
                 {
@@ -1439,7 +1453,14 @@ fn audio_thread(
                 // s.empty(): could be natural end-of-track OR mid-track underrun.
                 let dur = duration_ms.load(Ordering::Relaxed);
                 let st = state.read().unwrap().clone();
-                if st == PlaybackState::Playing && dur > 0 && cur_source_ms + 5000 < dur {
+                if let Some(ref clock) = active_clock {
+                    // Stream starvation emits silence while retaining the source;
+                    // an empty streaming sink is only a terminal decoder result.
+                    track_ended = !pause_requested
+                        && clock.ended.load(Ordering::Acquire)
+                        && !clock.failed.load(Ordering::Acquire);
+                    underrun_held_since = None;
+                } else if st == PlaybackState::Playing && dur > 0 && cur_source_ms + 5000 < dur {
                     // Mid-track underrun candidate: sink buffer is empty but
                     // we are at least 5s short of the natural end. Hold for
                     // 2s wall-clock before dispatching recovery.
@@ -1497,6 +1518,8 @@ fn audio_thread(
         }
 
         if track_ended {
+            active_clock = None;
+            current_session.fetch_add(1, Ordering::SeqCst);
             if let Some(s) = sink.take() {
                 s.stop();
             }
@@ -1534,247 +1557,130 @@ fn audio_thread(
     }
 }
 
-/// Prune the cache directory to at most `keep` MP3 files (by modification time).
-fn cleanup_cache(cache_dir: &std::path::Path, keep: usize) {
-    let mut entries: Vec<_> = std::fs::read_dir(cache_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "mp3")
-                .unwrap_or(false)
-        })
-        .filter_map(|e| {
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((e.path(), modified))
-        })
-        .collect();
+struct PreparedAudio {
+    sink: Player,
+    clock: Option<Arc<super::stream::StreamClock>>,
+    duration: Option<Duration>,
+}
 
-    if entries.len() <= keep {
-        return;
-    }
-
-    entries.sort_by_key(|e| std::cmp::Reverse(e.1)); // newest first
-    for (path, _) in entries.iter().skip(keep) {
-        let _ = std::fs::remove_file(path);
+impl PreparedAudio {
+    fn into_command(self, session_id: usize, resume_ms: u64, cached_duration_ms: u64) -> AudioCommand {
+        let duration_ms = self.duration
+            .filter(|duration| !duration.is_zero())
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(cached_duration_ms);
+        AudioCommand::Prepared {
+            clock: self.clock,
+            session_id,
+            sink: self.sink,
+            duration_ms,
+            resume_ms,
+        }
     }
 }
 
-/// Download audio via yt-dlp to a temp MP3 file, then decode with rodio.
-/// symphonia 0.5 cannot decode YouTube's M4A containers (SeekError on init),
-/// so we let yt-dlp + ffmpeg convert to MP3 which symphonia handles perfectly.
+struct PlaybackRequest<'a> {
+    video_id: &'a str,
+    current_session: &'a Arc<AtomicUsize>,
+    session_id: usize,
+    resume_ms: u64,
+}
+
+/// Deliberate offline downloads remain usable. Online playback decodes HTTP
+/// progressively, preserving old temp caches without preferring their MP3s.
 fn start_streaming(
-    video_id: &str,
-    state: &Arc<RwLock<PlaybackState>>,
+    request: PlaybackRequest<'_>,
     stream_handle: &Mixer,
     eq_settings: &Arc<RwLock<EqSettings>>,
     app: &tauri::AppHandle,
-    current_session: &Arc<AtomicUsize>,
-    session_id: usize,
-) -> Result<Player, crate::error::AppError> {
-    let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let bin = ytdlp_bin(app);
-
-    let cache_dir = std::env::temp_dir().join("sunder");
-    std::fs::create_dir_all(&cache_dir).map_err(crate::error::AppError::Io)?;
-    cleanup_cache(&cache_dir, 50);
-
-    let out_template = cache_dir.join(format!("{video_id}.%(ext)s"));
-    let expected_path = cache_dir.join(format!("{video_id}.mp3"));
-
-    // Offline-first: a persistently downloaded copy always wins. It never
-    // touches the network and is exempt from the LRU temp-cache cleanup.
+    tx: &std::sync::mpsc::Sender<AudioCommand>,
+) -> Result<PreparedAudio, crate::error::AppError> {
+    use crate::error::AppError;
+    let PlaybackRequest {
+        video_id,
+        current_session,
+        session_id,
+        resume_ms,
+    } = request;
+    if current_session.load(Ordering::Acquire) != session_id {
+        return Err(AppError::Audio("session superseded".into()));
+    }
+    if video_id.is_empty()
+        || !video_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(AppError::Audio("invalid video ID".into()));
+    }
     let download_path =
         crate::downloads::DownloadManager::dir_for(app).join(format!("{video_id}.mp3"));
-
-    if !download_path.exists() && !expected_path.exists() {
-        // Cold cache path: only here do we mark Buffering + emit progress,
-        // so cache-hit swaps don't flicker the buffering spinner (Group K).
-        *state.write().unwrap() = PlaybackState::Buffering;
+    let sink = Player::connect_new(stream_handle);
+    sink.pause();
+    sink.set_volume(0.0);
+    if download_path.exists() {
+        let file = std::fs::File::open(&download_path)?;
+        let file_len = file.metadata()?.len();
+        let mut decoder = Decoder::builder()
+            .with_data(io::BufReader::with_capacity(64 * 1024, file))
+            .with_byte_len(file_len)
+            .build()
+            .map_err(|e| AppError::Audio(format!("decoder init failed: {e}")))?;
+        let duration = decoder.total_duration();
+        if resume_ms > 0 {
+            decoder
+                .try_seek(Duration::from_millis(resume_ms))
+                .map_err(|e| AppError::Audio(format!("offline seek failed: {e}")))?;
+        }
         let _ = app.emit(
-            "download-progress",
+            "playback-quality",
             serde_json::json!({
-                "percent": 0.0, "stage": "preparing"
+                "video_id": video_id, "source": "offline", "codec": "mp3",
+                "bitrate_kbps": null, "sample_rate_hz": decoder.sample_rate().get(),
+                "channels": decoder.channels().get(), "format_id": null
             }),
         );
-
-        let out_path_str = out_template.to_str().unwrap_or_default();
-        let base_args: Vec<&str> = vec![
-            url.as_str(),
-            "--extract-audio",
-            "--audio-format",
-            "mp3",
-            "--audio-quality",
-            "2",
-            "-o",
-            out_path_str,
-            "--no-playlist",
-            "--newline",
-            "--concurrent-fragments",
-            "4",
-        ];
-        let fallback_args: &[&str] = &["--force-ipv4", "--geo-bypass", "--extractor-retries", "3"];
-        let mut last_error = String::new();
-
-        for attempt in 0..2u8 {
-            if attempt > 0 {
-                eprintln!("[sunder] retrying download (attempt {})", attempt + 1);
-                for ext in [
-                    "mp3",
-                    "webm",
-                    "m4a",
-                    "opus",
-                    "part",
-                    "webm.part",
-                    "m4a.part",
-                ] {
-                    let _ = std::fs::remove_file(cache_dir.join(format!("{video_id}.{ext}")));
-                }
-            }
-
-            let mut args = base_args.clone();
-            if attempt > 0 {
-                args.extend_from_slice(fallback_args);
-            }
-            // Session cookie source (never persisted): --cookies-from-browser
-            // or --cookies <file> when the user set one this session.
-            let cookie_args = crate::extraction::cookies::current_args();
-            let cookie_refs: Vec<&std::ffi::OsStr> =
-                cookie_args.iter().map(std::ffi::OsStr::new).collect();
-
-            let mut child = match Command::new(&bin)
-                .no_window()
-                .args(&args)
-                .args(&cookie_refs)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(crate::error::AppError::Extraction(format!(
-                        "failed to spawn yt-dlp: {e}"
-                    )))
-                }
-            };
-
-            if let Some(stdout) = child.stdout.take() {
-                for line in io::BufReader::new(stdout).lines().map_while(Result::ok) {
-                    if let Some(pct) = parse_download_pct(&line) {
-                        let _ = app.emit(
-                            "download-progress",
-                            serde_json::json!({
-                                "percent": pct, "stage": "downloading"
-                            }),
-                        );
-                    } else if line.contains("[ExtractAudio]") {
-                        let _ = app.emit(
-                            "download-progress",
-                            serde_json::json!({
-                                "percent": 100.0, "stage": "converting"
-                            }),
-                        );
-                    } else if line.contains("[youtube]") || line.contains("[info]") {
-                        let _ = app.emit(
-                            "download-progress",
-                            serde_json::json!({
-                                "percent": 0.0, "stage": "extracting"
-                            }),
-                        );
-                    }
-                }
-            }
-
-            let status = match child.wait() {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(crate::error::AppError::Extraction(format!(
-                        "yt-dlp wait: {e}"
-                    )))
-                }
-            };
-
-            if status.success() && expected_path.exists() {
-                last_error.clear();
-                break;
-            }
-
-            let stderr_out = child
-                .stderr
-                .take()
-                .map(|mut s| {
-                    let mut buf = String::new();
-                    let _ = s.read_to_string(&mut buf);
-                    buf
-                })
-                .unwrap_or_default();
-
-            last_error = if !stderr_out.is_empty() {
-                let trimmed = stderr_out.trim();
-                eprintln!(
-                    "[sunder] yt-dlp stderr (attempt {}): {}",
-                    attempt + 1,
-                    trimmed
-                );
-                format!(
-                    "yt-dlp failed ({}): {}",
-                    status,
-                    trimmed.lines().last().unwrap_or(trimmed)
-                )
-            } else {
-                format!("yt-dlp failed ({})", status)
-            };
-        }
-
-        if !last_error.is_empty() {
-            return Err(crate::error::AppError::Extraction(last_error));
-        }
-
-        if !expected_path.exists() {
-            return Err(crate::error::AppError::Extraction(format!(
-                "yt-dlp produced no output at {}",
-                expected_path.display()
-            )));
-        }
-    } else if download_path.exists() {
-        eprintln!("[sunder] offline hit: {}", download_path.display());
-    } else {
-        eprintln!("[sunder] cache hit: {}", expected_path.display());
+        sink.append(EqSource::new(decoder, eq_settings.clone()));
+        return Ok(PreparedAudio { sink, clock: None, duration });
     }
-
-    // Abort early if the user skipped to another track during download
-    if current_session.load(Ordering::SeqCst) != session_id {
-        return Err(crate::error::AppError::Audio("session superseded".into()));
+    let bin = crate::extraction::ytdlp::resolve_bin_for(app);
+    let info = crate::extraction::stream::resolve(&bin, video_id, current_session, session_id)
+        .map_err(AppError::Extraction)?;
+    if current_session.load(Ordering::Acquire) != session_id {
+        return Err(AppError::Audio("session superseded".into()));
     }
-
-    // Prefer the persistent offline copy when present.
-    let play_path = if download_path.exists() {
-        &download_path
-    } else {
-        &expected_path
-    };
-
-    let file_len = std::fs::metadata(play_path).map(|m| m.len()).unwrap_or(0);
-    eprintln!(
-        "[sunder] audio ready: {} bytes at {}",
-        file_len,
-        play_path.display()
+    let _ = app.emit(
+        "playback-quality",
+        serde_json::json!({
+            "video_id": video_id, "source": "stream", "codec": info.codec,
+            "bitrate_kbps": info.bitrate_kbps, "sample_rate_hz": info.sample_rate_hz,
+            "channels": info.channels, "format_id": info.format_id
+        }),
     );
-
-    let file = std::fs::File::open(play_path).map_err(crate::error::AppError::Io)?;
-    let decoder = Decoder::builder()
-        .with_data(io::BufReader::with_capacity(64 * 1024, file)) // this is to improve RAM usage. 64KB is enough.
-        .with_byte_len(file_len)
-        .build()
-        .map_err(|e| crate::error::AppError::Audio(format!("decoder init failed: {e}")))?;
-
-    let sink = Player::connect_new(stream_handle);
-    sink.set_volume(0.0);
-    sink.append(EqSource::new(decoder, eq_settings.clone()));
-
-    Ok(sink)
+    let failure_tx = tx.clone();
+    let failure_id = video_id.to_string();
+    let on_error = Arc::new(move |error| {
+        let _ = failure_tx.send(AudioCommand::LoadFailed {
+            session_id,
+            video_id: failure_id.clone(),
+            error,
+        });
+    });
+    let duration = info.duration;
+    let (source, clock) = super::stream::HttpSource::new(
+        crate::extraction::ytdlp::resolve_ffmpeg_for(app),
+        info,
+        current_session.clone(),
+        session_id,
+        Duration::from_millis(resume_ms),
+        on_error,
+    )
+    .map_err(AppError::Audio)?;
+    sink.append(EqSource::new(source, eq_settings.clone()));
+    Ok(PreparedAudio {
+        sink,
+        clock: Some(clock),
+        duration,
+    })
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -1806,15 +1712,33 @@ fn emit_state(
     );
 }
 
-fn parse_download_pct(line: &str) -> Option<f64> {
-    let content = line.trim().strip_prefix("[download]")?;
-    let pct_end = content.find('%')?;
-    content[..pct_end].trim().parse::<f64>().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_audio_propagates_resolved_duration_when_database_duration_is_missing_or_stale() {
+        let (mixer, _output) = rodio::mixer::mixer(2u16.try_into().unwrap(), 48_000u32.try_into().unwrap());
+        for (resolved, cached, expected) in [
+            (Some(Duration::from_millis(213_500)), 0, 213_500),
+            (Some(Duration::from_millis(213_500)), 180_000, 213_500),
+            (None, 180_000, 180_000),
+            (Some(Duration::ZERO), 180_000, 180_000),
+        ] {
+            let clock = Arc::new(super::super::stream::StreamClock::default());
+            let prepared = PreparedAudio {
+                sink: Player::connect_new(&mixer),
+                clock: Some(clock.clone()),
+                duration: resolved,
+            };
+            let AudioCommand::Prepared { duration_ms, clock: delivered_clock, session_id, resume_ms, .. } = prepared.into_command(7, 10_000, cached)
+                else { panic!("expected prepared playback"); };
+            assert_eq!(duration_ms, expected);
+            assert_eq!(session_id, 7);
+            assert_eq!(resume_ms, 10_000);
+            assert!(Arc::ptr_eq(&delivered_clock.unwrap(), &clock));
+        }
+    }
 
     #[test]
     fn relative_seek_moves_forward_within_known_duration() {

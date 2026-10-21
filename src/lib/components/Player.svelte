@@ -311,9 +311,7 @@
               <div class="dl-fill" style="width: {player.downloadPercent}%"></div>
             </div>
             <span class="dl-text">Downloading {Math.round(player.downloadPercent)}%</span>
-          {:else if player.downloadStage === "converting"}
-            <div class="dl-spinner"></div>
-            <span class="dl-text">Converting audio...</span>
+
           {:else if player.downloadStage === "extracting"}
             <div class="dl-spinner"></div>
             <span class="dl-text">Fetching stream info...</span>
@@ -341,6 +339,14 @@
         <div class="np-info">
           <span class="np-title">{player.currentTrack.title}</span>
           <span class="np-artist">{player.currentTrack.artist}</span>
+          {#if player.quality?.video_id === player.currentTrack.id}
+            <small class="np-artist" title={`Format ${player.quality.format_id ?? "unknown"}`}>
+              {player.quality.source}{#if player.quality.codec} - {player.quality.codec}{/if}
+              {#if player.quality.bitrate_kbps} - {Math.round(player.quality.bitrate_kbps)} kbps{/if}
+              {#if player.quality.sample_rate_hz} - {player.quality.sample_rate_hz / 1000} kHz{/if}
+              {#if player.quality.channels} - {player.quality.channels} ch{/if}
+            </small>
+          {/if}
         </div>
         <DownloadButton track={player.currentTrack} size={30} />
       </div>

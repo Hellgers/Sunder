@@ -1,10 +1,16 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::AppError;
 use crate::models::{Playlist, Track};
+
+const UPSERT_TRACK_SQL: &str = "INSERT INTO tracks (id, title, artist, thumbnail, duration)
+     VALUES (?1, ?2, ?3, ?4, ?5)
+     ON CONFLICT(id) DO UPDATE SET
+         title = excluded.title, artist = excluded.artist,
+         thumbnail = excluded.thumbnail, duration = excluded.duration";
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct CachedLyrics {
@@ -69,7 +75,7 @@ impl SearchCache {
                  track_id    TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
                  position    INTEGER NOT NULL DEFAULT 0,
                  added       TEXT NOT NULL DEFAULT (datetime('now')),
-                 PRIMARY KEY (playlist_id, track_id)
+                 PRIMARY KEY (playlist_id, position)
              );
 
              CREATE TABLE IF NOT EXISTS listen_history (
@@ -98,7 +104,9 @@ impl SearchCache {
         // Migration: downloads table. A legacy table lacking the expected
         // columns is dropped and recreated (no compatible data to preserve).
         let downloads_ok: i64 = conn
-            .prepare("SELECT COUNT(*) FROM pragma_table_info('downloads') WHERE name = 'downloaded'")
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('downloads') WHERE name = 'downloaded'",
+            )
             .and_then(|mut s| s.query_row([], |r| r.get(0)))
             .unwrap_or(0);
         if downloads_ok == 0 {
@@ -115,7 +123,10 @@ impl SearchCache {
         )?;
 
         // Migration: add thumbnail to playlists if missing
-        if let Err(e) = conn.execute("ALTER TABLE playlists ADD COLUMN thumbnail TEXT NOT NULL DEFAULT ''", []) {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE playlists ADD COLUMN thumbnail TEXT NOT NULL DEFAULT ''",
+            [],
+        ) {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
                 eprintln!("[sunder] playlists thumbnail migration failed: {e}");
@@ -123,29 +134,42 @@ impl SearchCache {
         }
 
         // Migration: add source_url to playlists if missing
-        if let Err(e) = conn.execute("ALTER TABLE playlists ADD COLUMN source_url TEXT NOT NULL DEFAULT ''", []) {
+        if let Err(e) = conn.execute(
+            "ALTER TABLE playlists ADD COLUMN source_url TEXT NOT NULL DEFAULT ''",
+            [],
+        ) {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
                 eprintln!("[sunder] playlists source_url migration failed: {e}");
             }
         }
 
-        Ok(Self { conn: Mutex::new(conn) })
+        migrate_playlist_occurrences(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS youtube_imports (
+                source_id TEXT PRIMARY KEY,
+                playlist_id INTEGER NOT NULL UNIQUE REFERENCES playlists(id) ON DELETE CASCADE,
+                snapshot TEXT NOT NULL,
+                imported_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn upsert_tracks(&self, tracks: &[Track]) -> Result<(), AppError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "INSERT INTO tracks (id, title, artist, thumbnail, duration)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(id) DO UPDATE SET
-                 title = excluded.title,
-                 artist = excluded.artist,
-                 thumbnail = excluded.thumbnail,
-                 duration = excluded.duration",
-        )?;
+        let mut stmt = conn.prepare_cached(UPSERT_TRACK_SQL)?;
         for t in tracks {
-            stmt.execute(params![t.id, t.title, t.artist, t.thumbnail, t.duration_secs])?;
+            stmt.execute(params![
+                t.id,
+                t.title,
+                t.artist,
+                t.thumbnail,
+                t.duration_secs
+            ])?;
         }
         Ok(())
     }
@@ -196,7 +220,8 @@ impl SearchCache {
 
     pub fn get_lyric_offset(&self, track_id: &str) -> Result<i64, AppError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT offset_ms FROM lyric_offsets WHERE track_id = ?1")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT offset_ms FROM lyric_offsets WHERE track_id = ?1")?;
         let mut rows = stmt.query(params![track_id])?;
         if let Some(row) = rows.next()? {
             Ok(row.get(0)?)
@@ -240,7 +265,9 @@ impl SearchCache {
             return Ok(vec![]);
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders: String = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders: String = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT id, title, artist, thumbnail, duration FROM tracks WHERE id IN ({placeholders})"
         );
@@ -318,6 +345,54 @@ impl SearchCache {
         })
     }
 
+    /// Save a queue or imported document as one atomic ordered snapshot. Unlike
+    /// the single-track UI add action, every occurrence is intentional here.
+    pub fn create_playlist_from_tracks(
+        &self,
+        name: &str,
+        tracks: &[Track],
+    ) -> Result<Playlist, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let thumbnail = tracks
+            .first()
+            .map(|track| track.thumbnail.as_str())
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO playlists(name, thumbnail) VALUES(?1, ?2)",
+            params![name, thumbnail],
+        )?;
+        let id = tx.last_insert_rowid();
+        {
+            let mut metadata = tx.prepare_cached(UPSERT_TRACK_SQL)?;
+            let mut occurrence = tx.prepare_cached(
+                "INSERT INTO playlist_tracks(playlist_id, track_id, position) VALUES(?1, ?2, ?3)",
+            )?;
+            for (position, track) in tracks.iter().enumerate() {
+                metadata.execute(params![
+                    track.id,
+                    track.title,
+                    track.artist,
+                    track.thumbnail,
+                    track.duration_secs
+                ])?;
+                occurrence.execute(params![id, track.id, position as i64])?;
+            }
+        }
+        let track_count = tx.query_row(
+            "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Playlist {
+            id,
+            name: name.to_owned(),
+            thumbnail: thumbnail.to_owned(),
+            track_count,
+        })
+    }
+
     pub fn list_playlists(&self) -> Result<Vec<Playlist>, AppError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
@@ -363,7 +438,10 @@ impl SearchCache {
             |r| r.get(0),
         )?;
         conn.execute(
-            "INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?1, ?2, ?3)",
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
+             SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
+                 SELECT 1 FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2
+             )",
             params![playlist_id, track_id, pos],
         )?;
         Ok(())
@@ -399,7 +477,11 @@ impl SearchCache {
         Ok(url.filter(|s: &String| !s.is_empty()))
     }
 
-    pub fn replace_playlist_tracks(&self, playlist_id: i64, track_ids: &[String]) -> Result<(), AppError> {
+    pub fn replace_playlist_tracks(
+        &self,
+        playlist_id: i64,
+        track_ids: &[String],
+    ) -> Result<(), AppError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -416,17 +498,133 @@ impl SearchCache {
         Ok(())
     }
 
-    pub fn reorder_playlist_tracks(&self, playlist_id: i64, track_ids: &[String]) -> Result<(), AppError> {
+    pub fn reorder_playlist_tracks(
+        &self,
+        playlist_id: i64,
+        track_ids: &[String],
+    ) -> Result<(), AppError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        for (i, tid) in track_ids.iter().enumerate() {
-            tx.execute(
-                "UPDATE playlist_tracks SET position = ?3 WHERE playlist_id = ?1 AND track_id = ?2",
-                params![playlist_id, tid, i as i64],
-            )?;
+        let existing: Vec<(String, String)> = {
+            let mut statement = tx.prepare("SELECT track_id, added FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position")?;
+            let rows =
+                statement.query_map(params![playlist_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        // Rebuild atomically by occurrence, preserving duplicate IDs and each added time.
+        // A stale or incomplete request must not delete songs from the playlist.
+        let mut remaining = existing;
+        let mut ordered = Vec::with_capacity(track_ids.len());
+        for id in track_ids {
+            let Some(index) = remaining.iter().position(|(track_id, _)| track_id == id) else {
+                return Err(AppError::Database(rusqlite::Error::InvalidParameterName(
+                    "Playlist changed; reload it before reordering".into(),
+                )));
+            };
+            ordered.push(remaining.remove(index));
+        }
+        if !remaining.is_empty() {
+            return Err(AppError::Database(rusqlite::Error::InvalidParameterName(
+                "Playlist changed; reload it before reordering".into(),
+            )));
+        }
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+            params![playlist_id],
+        )?;
+        for (position, (track_id, added)) in ordered.iter().enumerate() {
+            tx.execute("INSERT INTO playlist_tracks(playlist_id,track_id,position,added) VALUES(?1,?2,?3,?4)", params![playlist_id,track_id,position as i64,added])?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Commit an entire fetched snapshot in one transaction. A partial refresh never
+    /// replaces an already imported complete snapshot. Source IDs make reruns idempotent.
+    pub fn import_youtube_snapshot(
+        &self,
+        namespace: &str,
+        snapshot: &crate::ytmusic::types::SourcePlaylist,
+    ) -> Result<(i64, bool), AppError> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+        let source_key = format!("{namespace}:{}", snapshot.source.source_id);
+        let existing: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT playlist_id,snapshot FROM youtube_imports WHERE source_id = ?1",
+                params![source_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, previous)) = &existing {
+            if !snapshot.complete {
+                let previous: Result<crate::ytmusic::types::SourcePlaylist, _> =
+                    serde_json::from_str(previous);
+                if previous
+                    .map(|value| value.complete || value.tracks.len() > snapshot.tracks.len())
+                    .unwrap_or(false)
+                {
+                    return Ok((*id, false));
+                }
+            }
+        }
+        let id = if let Some((id, _)) = existing {
+            id
+        } else {
+            tx.execute(
+                "INSERT INTO playlists(name,thumbnail,source_url) VALUES(?1,?2,?3)",
+                params![
+                    snapshot.source.title,
+                    snapshot.source.thumbnail,
+                    format!(
+                        "https://music.youtube.com/playlist?list={}",
+                        snapshot.source.source_id
+                    )
+                ],
+            )?;
+            tx.last_insert_rowid()
+        };
+        tx.execute(
+            "UPDATE playlists SET name = ?2, thumbnail = ?3 WHERE id = ?1",
+            params![id, snapshot.source.title, snapshot.source.thumbnail],
+        )?;
+        tx.execute(
+            "DELETE FROM playlist_tracks WHERE playlist_id = ?1",
+            params![id],
+        )?;
+        for (position, row) in snapshot.tracks.iter().enumerate() {
+            let track = &row.track;
+            let local_track_id = if row.available {
+                track.id.clone()
+            } else {
+                format!(
+                    "unavailable:{namespace}:{}:{position}",
+                    snapshot.source.source_id
+                )
+            };
+            tx.execute("INSERT INTO tracks(id,title,artist,thumbnail,duration) VALUES(?1,?2,?3,?4,?5)
+                ON CONFLICT(id) DO UPDATE SET title=excluded.title,artist=excluded.artist,thumbnail=excluded.thumbnail,duration=excluded.duration",
+                params![local_track_id,track.title,track.artist,track.thumbnail,track.duration_secs])?;
+            tx.execute(
+                "INSERT INTO playlist_tracks(playlist_id,track_id,position) VALUES(?1,?2,?3)",
+                params![id, local_track_id, position as i64],
+            )?;
+        }
+        let serialized = serde_json::to_string(snapshot)
+            .map_err(|_| AppError::Database(rusqlite::Error::InvalidQuery))?;
+        tx.execute("INSERT INTO youtube_imports(source_id,playlist_id,snapshot) VALUES(?1,?2,?3)
+            ON CONFLICT(source_id) DO UPDATE SET snapshot=excluded.snapshot,imported_at=datetime('now')",
+            params![source_key,id,serialized])?;
+        tx.commit()?;
+        Ok((id, true))
+    }
+
+    pub fn youtube_imported_playlist_ids(&self) -> Result<Vec<i64>, AppError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement =
+            conn.prepare("SELECT playlist_id FROM youtube_imports ORDER BY playlist_id")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn playlists_containing_track(&self, track_id: &str) -> Result<Vec<i64>, AppError> {
@@ -491,7 +689,10 @@ impl SearchCache {
 
     pub fn remove_download(&self, track_id: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM downloads WHERE track_id = ?1", params![track_id])?;
+        conn.execute(
+            "DELETE FROM downloads WHERE track_id = ?1",
+            params![track_id],
+        )?;
         Ok(())
     }
 
@@ -555,8 +756,7 @@ impl SearchCache {
     /// Per-track download sizes in bytes, as (track_id, size) pairs.
     pub fn download_sizes(&self) -> Result<Vec<(String, i64)>, AppError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare_cached("SELECT track_id, COALESCE(size, 0) FROM downloads")?;
+        let mut stmt = conn.prepare_cached("SELECT track_id, COALESCE(size, 0) FROM downloads")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
@@ -615,8 +815,10 @@ impl SearchCache {
         Ok(tracks)
     }
 
-
-    pub fn recent_track_ids(&self, days: i64) -> Result<std::collections::HashSet<String>, AppError> {
+    pub fn recent_track_ids(
+        &self,
+        days: i64,
+    ) -> Result<std::collections::HashSet<String>, AppError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT track_id FROM listen_history
@@ -644,18 +846,82 @@ impl SearchCache {
 
         let mut freq: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         let stopwords: std::collections::HashSet<&str> = [
-            "the", "a", "an", "and", "or", "of", "in", "on", "at", "to", "for",
-            "is", "it", "my", "me", "i", "you", "we", "he", "she", "this", "that",
-            "with", "from", "by", "not", "no", "but", "so", "if", "up", "out",
-            "all", "just", "like", "one", "do", "don", "be", "am", "are", "was",
-            "has", "had", "have", "will", "can", "would", "could", "should",
-            "ft", "feat", "vs", "official", "video", "audio", "music",
-            "lyric", "lyrics", "visualizer", "visualiser", "hd", "hq",
-            "full", "new", "version", "album", "single", "ep",
-        ].into_iter().collect();
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "in",
+            "on",
+            "at",
+            "to",
+            "for",
+            "is",
+            "it",
+            "my",
+            "me",
+            "i",
+            "you",
+            "we",
+            "he",
+            "she",
+            "this",
+            "that",
+            "with",
+            "from",
+            "by",
+            "not",
+            "no",
+            "but",
+            "so",
+            "if",
+            "up",
+            "out",
+            "all",
+            "just",
+            "like",
+            "one",
+            "do",
+            "don",
+            "be",
+            "am",
+            "are",
+            "was",
+            "has",
+            "had",
+            "have",
+            "will",
+            "can",
+            "would",
+            "could",
+            "should",
+            "ft",
+            "feat",
+            "vs",
+            "official",
+            "video",
+            "audio",
+            "music",
+            "lyric",
+            "lyrics",
+            "visualizer",
+            "visualiser",
+            "hd",
+            "hq",
+            "full",
+            "new",
+            "version",
+            "album",
+            "single",
+            "ep",
+        ]
+        .into_iter()
+        .collect();
 
         for title in &titles {
-            let cleaned = title.to_lowercase()
+            let cleaned = title
+                .to_lowercase()
                 .replace(|c: char| !c.is_alphanumeric() && c != ' ', " ");
             for word in cleaned.split_whitespace() {
                 if word.len() < 3 || stopwords.contains(word) {
@@ -673,11 +939,46 @@ impl SearchCache {
 
     pub fn listen_count(&self) -> Result<i64, AppError> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM listen_history", [], |r| r.get(0),
-        )?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM listen_history", [], |r| r.get(0))?;
         Ok(count)
     }
+}
+
+/// Migrate the legacy track-identity key to an occurrence key, atomically retaining
+/// all current columns, foreign keys, ordering, added timestamps and user indexes.
+fn migrate_playlist_occurrences(conn: &Connection) -> Result<(), AppError> {
+    let legacy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('playlist_tracks') WHERE name = 'track_id' AND pk > 0", [], |row| row.get(0),
+    )?;
+    if legacy == 0 {
+        return Ok(());
+    }
+    let schema_objects: Vec<String> = {
+        let mut statement = conn.prepare("SELECT sql FROM sqlite_master WHERE tbl_name = 'playlist_tracks' AND type IN ('index','trigger') AND sql IS NOT NULL")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE playlist_tracks RENAME TO playlist_tracks_legacy;
+         CREATE TABLE playlist_tracks (
+            playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+            track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL DEFAULT 0,
+            added TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (playlist_id, position)
+         );
+         INSERT INTO playlist_tracks(playlist_id,track_id,position,added)
+         SELECT playlist_id,track_id,
+            ROW_NUMBER() OVER (PARTITION BY playlist_id ORDER BY position,rowid)-1,added
+         FROM playlist_tracks_legacy;
+         DROP TABLE playlist_tracks_legacy;",
+    )?;
+    for sql in schema_objects {
+        tx.execute_batch(&sql)?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -703,6 +1004,199 @@ mod tests {
             duration_secs: 210.0,
             stream_url: None,
         }
+    }
+
+    #[test]
+    fn occurrence_migration_preserves_rows_timestamps_indexes_and_foreign_keys() {
+        let db = temp_cache();
+        db.upsert_tracks(&[sample_track("one"), sample_track("two")])
+            .unwrap();
+        let playlist = db.create_playlist("Legacy", "art").unwrap();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch("DROP TABLE playlist_tracks;
+            CREATE TABLE playlist_tracks(playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+                track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0,
+                added TEXT NOT NULL DEFAULT(datetime('now')),PRIMARY KEY(playlist_id,track_id));
+            CREATE INDEX fixture_track_lookup ON playlist_tracks(track_id);").unwrap();
+        conn.execute(
+            "INSERT INTO playlist_tracks VALUES(?1,'one',7,'2020-01-02')",
+            params![playlist.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlist_tracks VALUES(?1,'two',2,'2020-01-01')",
+            params![playlist.id],
+        )
+        .unwrap();
+        migrate_playlist_occurrences(&conn).unwrap();
+        migrate_playlist_occurrences(&conn).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT track_id,added FROM playlist_tracks ORDER BY position")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("two".into(), "2020-01-01".into()),
+                ("one".into(), "2020-01-02".into())
+            ]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='fixture_track_lookup'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "INSERT INTO playlist_tracks(playlist_id,track_id,position) VALUES(?1,'one',2)",
+            params![playlist.id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert!(conn
+            .execute("INSERT INTO playlist_tracks VALUES(999,'one',0,'x')", [])
+            .is_err());
+        conn.execute("DELETE FROM tracks WHERE id='one'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn occurrence_migration_failure_rolls_back_legacy_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE playlists(id INTEGER PRIMARY KEY); CREATE TABLE tracks(id TEXT PRIMARY KEY);
+            CREATE TABLE playlist_tracks(playlist_id INTEGER NOT NULL REFERENCES playlists(id),track_id TEXT NOT NULL REFERENCES tracks(id),
+                position INTEGER NOT NULL,added TEXT NOT NULL,PRIMARY KEY(playlist_id,track_id));
+            CREATE UNIQUE INDEX fixture_global_position ON playlist_tracks(position);
+            INSERT INTO playlists VALUES(1),(2); INSERT INTO tracks VALUES('one'),('two');
+            INSERT INTO playlist_tracks VALUES(1,'one',7,'kept-one'),(2,'two',9,'kept-two');").unwrap();
+        // Both legacy rows are valid. Per-playlist normalization produces 0/0,
+        // so restoring this custom global unique index fails late in migration.
+        let error = migrate_playlist_occurrences(&conn).unwrap_err();
+        assert!(
+            matches!(error, AppError::Database(rusqlite::Error::SqliteFailure(ref failure, _))
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+        );
+        let rows: Vec<(i64, String, i64, String)> = conn.prepare("SELECT playlist_id,track_id,position,added FROM playlist_tracks ORDER BY playlist_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "one".into(), 7, "kept-one".into()),
+                (2, "two".into(), 9, "kept-two".into())
+            ]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='fixture_global_position'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_table_info('playlist_tracks') WHERE name='track_id' AND pk>0",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    fn source_snapshot() -> crate::ytmusic::types::SourcePlaylist {
+        use crate::ytmusic::types::*;
+        SourcePlaylist {
+            source: LibraryEntry {
+                source_id: "PL-fixture".into(),
+                title: "Imported".into(),
+                thumbnail: String::new(),
+                expected_count: Some(3),
+            },
+            tracks: vec![
+                SourceTrack {
+                    position: 0,
+                    source_video_id: Some("same".into()),
+                    available: true,
+                    track: sample_track("same"),
+                },
+                SourceTrack {
+                    position: 1,
+                    source_video_id: Some("same".into()),
+                    available: true,
+                    track: sample_track("same"),
+                },
+                SourceTrack {
+                    position: 2,
+                    source_video_id: None,
+                    available: false,
+                    track: sample_track("unavailable:PL-fixture:2"),
+                },
+            ],
+            complete: true,
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn youtube_import_preserves_duplicates_unavailable_order_and_is_idempotent() {
+        let db = temp_cache();
+        let snapshot = source_snapshot();
+        let (first_id, saved) = db.import_youtube_snapshot("account", &snapshot).unwrap();
+        assert!(saved);
+        let (second_id, _) = db.import_youtube_snapshot("account", &snapshot).unwrap();
+        assert_eq!(first_id, second_id);
+        assert_eq!(db.list_playlists().unwrap().len(), 1);
+        let tracks = db.get_playlist_tracks(first_id).unwrap();
+        assert_eq!(
+            tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["same", "same", "unavailable:account:PL-fixture:2"]
+        );
+        let mut partial = snapshot.clone();
+        partial.complete = false;
+        partial.tracks.truncate(1);
+        assert!(!db.import_youtube_snapshot("account", &partial).unwrap().1);
+        assert_eq!(db.get_playlist_tracks(first_id).unwrap().len(), 3);
+        let (other_id, _) = db
+            .import_youtube_snapshot("other-account", &snapshot)
+            .unwrap();
+        assert_ne!(other_id, first_id);
+        db.reorder_playlist_tracks(
+            first_id,
+            &[
+                "unavailable:account:PL-fixture:2".into(),
+                "same".into(),
+                "same".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_playlist_tracks(first_id).unwrap()[0].id,
+            "unavailable:account:PL-fixture:2"
+        );
+        assert!(db
+            .reorder_playlist_tracks(first_id, &["same".into()])
+            .is_err());
+        assert_eq!(db.get_playlist_tracks(first_id).unwrap().len(), 3);
     }
 
     #[test]
@@ -736,7 +1230,9 @@ mod tests {
     #[test]
     fn get_track_by_id_latency() {
         let db = temp_cache();
-        let tracks: Vec<Track> = (0..1000).map(|i| sample_track(&format!("vid_{i}"))).collect();
+        let tracks: Vec<Track> = (0..1000)
+            .map(|i| sample_track(&format!("vid_{i}")))
+            .collect();
         db.upsert_tracks(&tracks).unwrap();
 
         let t0 = Instant::now();
@@ -781,7 +1277,8 @@ mod tests {
     #[test]
     fn playlist_crud() {
         let db = temp_cache();
-        db.upsert_tracks(&[sample_track("t1"), sample_track("t2")]).unwrap();
+        db.upsert_tracks(&[sample_track("t1"), sample_track("t2")])
+            .unwrap();
 
         let pl = db.create_playlist("My List", "").unwrap();
         assert_eq!(pl.name, "My List");
@@ -802,5 +1299,93 @@ mod tests {
 
         db.delete_playlist(pl.id).unwrap();
         assert!(db.list_playlists().unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_playlist_from_tracks_keeps_order_duplicate_occurrences_and_actual_count() {
+        let db = temp_cache();
+        let mut first = sample_track("A");
+        first.thumbnail = "fixture-cover".into();
+        first.title = "Original title".into();
+        db.upsert_tracks(std::slice::from_ref(&first)).unwrap();
+        first.title = "Updated title".into();
+        let tracks = vec![first.clone(), first, sample_track("B")];
+        let playlist = db
+            .create_playlist_from_tracks("Queue snapshot", &tracks)
+            .unwrap();
+        assert_eq!(playlist.track_count, 3);
+        assert_eq!(playlist.thumbnail, "fixture-cover");
+        let saved = db.get_playlist_tracks(playlist.id).unwrap();
+        assert_eq!(
+            saved
+                .iter()
+                .map(|track| track.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["A", "A", "B"]
+        );
+        assert_eq!(saved[0].title, "Updated title");
+        assert_eq!(
+            db.list_playlists().unwrap()[0].track_count,
+            saved.len() as i64
+        );
+        let conn = db.conn.lock().unwrap();
+        let positions: Vec<i64> = conn
+            .prepare(
+                "SELECT position FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position",
+            )
+            .unwrap()
+            .query_map(params![playlist.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn create_playlist_from_tracks_failure_rolls_back_new_playlist_metadata_and_occurrences() {
+        let db = temp_cache();
+        let original = sample_track("A");
+        db.upsert_tracks(std::slice::from_ref(&original)).unwrap();
+        let existing = db.create_playlist("Existing playlist", "").unwrap();
+        db.add_to_playlist(existing.id, "A").unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fixture_reject_third_occurrence BEFORE INSERT ON playlist_tracks
+                WHEN NEW.position = 2 BEGIN SELECT RAISE(ABORT, 'fixture injected failure'); END;",
+            )
+            .unwrap();
+        }
+        let mut changed = original.clone();
+        changed.title = "Must roll back".into();
+        assert!(db
+            .create_playlist_from_tracks(
+                "Must not remain",
+                &[changed.clone(), changed, sample_track("B")]
+            )
+            .is_err());
+        let playlists = db.list_playlists().unwrap();
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].id, existing.id);
+        assert_eq!(
+            db.get_track_by_id("A").unwrap().unwrap().title,
+            original.title
+        );
+        assert!(db.get_track_by_id("B").unwrap().is_none());
+        assert_eq!(db.get_playlist_tracks(existing.id).unwrap().len(), 1);
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM playlist_tracks", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
     }
 }

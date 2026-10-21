@@ -17,6 +17,42 @@
 
 ## What is Sunder?
 
+### Hellgers streaming fork
+
+This branch adds direct HTTP audio playback, real YouTube Music recommendations
+and song radio, and an account library import. It is based on FrogSnot/Sunder.
+
+- Online playback resolves the best available audio format, then decodes the HTTP
+  stream progressively into a bounded PCM buffer. It does not download a complete
+  music file or re-encode it to MP3 before playback. Explicit offline downloads
+  remain available.
+- Explore uses the connected account's YouTube Music home feed. Song radio comes
+  from YouTube Music rather than a search for similar titles.
+- Account import reads every playlist page, including Liked Music. It preserves
+  order, duplicates, and unavailable entries. Incomplete results are reported and
+  do not replace an existing complete snapshot. Imported snapshots are read-only;
+  regular local playlists remain editable.
+- Connect through **YouTube account → Choose session file and connect**. Export
+  headers of your own authenticated YouTube Music `browse` request using the
+  [upstream browser setup guide](https://ytmusicapi.readthedocs.io/en/stable/setup/browser.html),
+  save them privately, and choose that file in Sunder. Raw headers, a JSON header
+  object, and Chromium **Copy as fetch (Node.js)** text are supported. The exported
+  text is parsed as data and is never executed. Only the native app reads it.
+  It verifies the browser account's stable channel identity before saving the
+  session with Windows DPAPI in `%LOCALAPPDATA%\Sunder\YouTubeMusic\`.
+- TV OAuth remains in Advanced setup, but a successful Google authorization does
+  not imply working Music access. Google's Music API can reject otherwise valid
+  OAuth tokens; this is tracked in [ytmusicapi #813](https://github.com/sigma67/ytmusicapi/issues/813).
+  Browser connection is the primary path. No shared OAuth client is embedded.
+- Music endpoints are unofficial and can change. Playback shows the actual source
+  codec and bitrate when available; this fork does not grant Premium entitlements
+  or claim lossless/Hi-Res audio.
+
+For a portable Windows build, keep `yt-dlp.exe` and `ffmpeg.exe` next to
+`sunder.exe`. Explicit `SUNDER_YTDLP_PATH` / `SUNDER_FFMPEG_PATH` overrides are
+supported. Back up the app data before switching versions because the playlist
+database is migrated to retain repeated tracks.
+
 Sunder is a lightweight, native desktop music player that streams from YouTube without the bloat. Built with Tauri v2 and Rust, it uses a fraction of the memory that Electron-based alternatives consume while delivering a buttery smooth UI with hand-crafted animations.
 
 The name says it all: to *sunder* means to split apart. We split the music from the surveillance.
@@ -28,9 +64,8 @@ The name says it all: to *sunder* means to split apart. We split the music from 
 - **Native audio** via rodio, talking directly to ALSA/PipeWire/Pulse with no Web Audio overhead
 - **Playback speed control** adjustable from 0.25x to 3x via a slider in the controls popup
 - **Smart error recovery** if a track fails (geo-blocked, age-gated, unavailable), a banner appears offering to find an alternative version automatically, with auto-skip fallback if ignored
-- **Retry with bypass** yt-dlp failures trigger a silent retry with `--force-ipv4` and `--geo-bypass` before giving up
 - **403-aware recovery with one-click yt-dlp update** when YouTube blocks streams because the installed yt-dlp is outdated (the most common cause of sudden 403 errors), Sunder shows exactly that, with the current yt-dlp version, and an *Update yt-dlp* button that downloads the latest official release into Sunder's own data directory (verified and atomically installed, no root needed), then retries the track automatically. All network fetches happen only on that explicit click. The one-click update is Linux-only; on Windows/macOS (or when `SUNDER_YTDLP_PATH` is set) the banner instead explains how to fix it, with a Retry button
-- **Non-blocking prefetch** audio is prepared in a background thread with early session checks to discard stale loads; upcoming tracks are pre-downloaded for seamless transitions
+- **Non-blocking preparation** stream resolution runs off the audio thread; stale sessions are cancelled and prefetch warms metadata without downloading music.
 
 ### Lyrics
 - **Synchronized lyrics** fetched on demand via yt-dlp subtitles and displayed in a dedicated view
@@ -70,10 +105,10 @@ The name says it all: to *sunder* means to split apart. We split the music from 
 ### App
 - **Focus View** full-screen mode with blurred album art background, toggled with `V` or the focus button
 - **Playback Controls popup** consolidates EQ, notifications, speed, and sleep timer into a single dropdown
-- **Explore** with personalized recommendations built from your listening history
+- **Explore** with the connected YouTube Music account's personalized recommendations
 - **Warm animated UI** with spring physics, staggered entrances, glow pulses, and micro-interactions
 - **~15MB binary** with release optimizations (LTO, strip, single codegen unit)
-- **Zero telemetry**. Nothing leaves your machine except YouTube search queries
+- **No added telemetry**. Search, media, lyrics, optional Discord presence, update checks, and connected-account features contact their respective services.
 
 ### Data & Storage
 Sunder keeps everything in the platform app-data directory for its identifier `com.sunder.app`:

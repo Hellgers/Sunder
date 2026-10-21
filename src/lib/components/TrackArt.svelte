@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isPlayable } from "../util/tracks";
   import DownloadButton from "./DownloadButton.svelte";
   import { downloads } from "../state/downloads.svelte";
   import type { Track } from "../types";
@@ -34,7 +35,7 @@
   <button
     class="ta-play"
     onclick={() => onplay?.(track)}
-    disabled={!onplay}
+    disabled={!onplay || !isPlayable(track)}
     aria-label="Play {track.title}"
   >
     {#if track.thumbnail}
@@ -51,7 +52,7 @@
     </span>
   </button>
 
-  {#if badge}
+  {#if badge && isPlayable(track)}
     <span class="ta-badge" class:visible={downloaded || isActive}>
       <DownloadButton {track} size={badgeSize} />
     </span>

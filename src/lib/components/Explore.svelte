@@ -1,493 +1,134 @@
 <script lang="ts">
-  import { tooltip } from "../util/tooltip.svelte";
-  import { onMount } from "svelte";
-  import { getExplore, playTrack } from "../ipc/bridge";
-  import { player } from "../state/player.svelte";
-  import { exploreCache } from "../state/explore.svelte";
-  import { toastState } from "../state/toast.svelte";
-  import { downloads } from "../state/downloads.svelte";
-  import ContextMenu from "./ContextMenu.svelte";
-  import WormText from "./WormText.svelte";
-  import type { Track } from "../types";
-
-  let sections = $derived(exploreCache.sections);
-  let loading = $derived(exploreCache.loading);
-  let ctxMenu: ReturnType<typeof ContextMenu>;
-
-  onMount(async () => {
-    if (!exploreCache.stale) return;
-    exploreCache.loading = true;
-    try {
-      const data = await getExplore();
-      exploreCache.sections = data.sections;
-      exploreCache.loaded = true;
-      exploreCache.fetchedAt = Date.now();
-    } catch (e) {
-      console.error("explore failed:", e);
-      toastState.add(`Failed to load explore: ${e}`, "error");
-    } finally {
-      exploreCache.loading = false;
-    }
-  });
-
-  function formatDuration(secs: number): string {
-    if (!secs) return "--:--";
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60);
-    return `${m}:${s.toString().padStart(2, "0")}`;
+ import { onMount } from "svelte";
+ import { getExplore, playTrack, ytmusicHome, ytmusicStatus, ytmusicBrowse } from "../ipc/bridge";
+ import { player } from "../state/player.svelte";
+ import { nav } from "../state/nav.svelte";
+ import { isPlayable } from "../util/tracks";
+ import ContextMenu from "./ContextMenu.svelte";
+ import type { Track, YtmHome, YtmItem } from "../types";
+ let home = $state<YtmHome | null>(null);
+ let publicSections = $state<{title: string; tracks: Track[]}[]>([]);
+ let connected = $state(false);
+ let loading = $state(true);
+ let error = $state("");
+ let browse = $state<{title: string; tracks: Track[]} | null>(null);
+ let ctxMenu: ReturnType<typeof ContextMenu>;
+ let disposed = false;
+ let request = 0;
+ onMount(() => { load(); return () => { disposed = true; request++; }; });
+ async function load() {
+  loading = true; error = "";
+  try {
+   connected = (await ytmusicStatus()).connected;
+   if (disposed) return;
+   if (connected) {
+    const result = await ytmusicHome();
+    if (!result.personalized) throw new Error("YouTube Music did not return a personal home");
+    if (!disposed) home = result;
+   }
+  } catch (e) { if (!disposed) error = String(e); }
+  finally { if (!disposed) loading = false; }
+ }
+ async function loadPublic() {
+  loading = true; error = "";
+  try { const result = await getExplore(); if (!disposed) publicSections = result.sections; }
+  catch (e) { if (!disposed) error = String(e); }
+  finally { if (!disposed) loading = false; }
+ }
+ async function openItem(item: YtmItem) {
+  if (item.kind === "track") {
+   if (item.track) await play(item.track);
+   else error = "YouTube Music returned a track without playback metadata";
+   return;
   }
-
-  function fallbackInitial(track: Track): string {
-    return (track.title || track.artist || "?").trim().slice(0, 1).toUpperCase();
-  }
-
-  function handleShelfWheel(e: WheelEvent) {
-    if (!e.shiftKey) return;
-    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
-
-    const shelf = e.currentTarget as HTMLElement;
-    const atStart = shelf.scrollLeft <= 0 && e.deltaY < 0;
-    const atEnd = shelf.scrollLeft + shelf.clientWidth >= shelf.scrollWidth - 1 && e.deltaY > 0;
-    if (atStart || atEnd) return;
-
-    shelf.scrollLeft += e.deltaY;
-    e.preventDefault();
-  }
-
-  async function handlePlay(track: Track) {
-    try {
-      await playTrack(track);
-    } catch (e) {
-      console.error("play failed:", e);
-      toastState.add(`Failed to play track: ${e}`, "error");
-    }
-  }
-
-  function isActive(track: Track): boolean {
-    return player.currentTrack?.id === track.id;
-  }
-
-  function handleContext(e: MouseEvent, track: Track) {
-    ctxMenu.open(e, track);
-  }
+  const id = ++request;
+  loading = true; error = "";
+  try { const result = await ytmusicBrowse(item.id); if (!disposed && id === request) browse = result; }
+  catch (e) { if (!disposed && id === request) error = String(e); }
+  finally { if (!disposed && id === request) loading = false; }
+ }
+ async function play(track: Track) {
+  try { await playTrack(track); } catch (e) { error = String(e); }
+ }
+ async function playBrowse(index: number) {
+  if (!browse || !isPlayable(browse.tracks[index])) return;
+  player.setQueue(browse.tracks);
+  const track = player.playFromQueue(index);
+  if (track) await play(track);
+ }
 </script>
-
 <ContextMenu bind:this={ctxMenu} />
-
-{#if loading}
-  <div class="loading">
-    <div class="loading-header">
-      <div class="eq-loader">
-        <div class="eq-bar"></div>
-        <div class="eq-bar"></div>
-        <div class="eq-bar"></div>
-        <div class="eq-bar"></div>
-      </div>
-      <p>Discovering music...</p>
+<div class="explore">
+ <div class="section-header"><h2 class="section-title">{browse ? browse.title : "YouTube Music Explore"}</h2>
+  {#if browse}<button onclick={() => { browse = null; request++; }}>Back to Explore</button>
+  {:else if connected}<button disabled={loading} onclick={load}>Refresh</button>{/if}
+ </div>
+ {#if error}<p role="alert">{error}</p>{/if}
+ {#if loading}<p role="status">Loading YouTube Music-</p>{/if}
+ {#if !connected}
+  <div class="section">
+   <p>Connect your YouTube Music account to see your personal home and recommendations.</p>
+   <button onclick={() => nav.activeTab = "account"}>Connect YouTube Music</button>
+  </div>
+ {/if}
+ {#if browse}
+  <div class="browse-list">
+   {#each browse.tracks as track, i (i)}
+    <button class:unavailable={!isPlayable(track)} disabled={!isPlayable(track)} onclick={() => playBrowse(i)} oncontextmenu={e => ctxMenu.open(e, track)}>
+     <span>{i + 1}. {track.title}</span><span>{isPlayable(track) ? track.artist : "Unavailable - preserved in order"}</span>
+    </button>
+   {/each}
+  </div>
+ {:else if home}
+  {#each home.sections as section, si (si)}
+   <section class="section">
+    <h2 class="section-title">{section.title}</h2>
+    <div class="card-grid">
+     {#each section.items as item, i (i)}
+      <button class="card" onclick={() => openItem(item)} oncontextmenu={e => { if (item.track) ctxMenu.open(e, item.track); }}>
+       <span class="art-shell">{#if item.thumbnail}<img class="card-thumb" src={item.thumbnail} alt="" loading="lazy" />{:else}<span class="art-fallback">{item.title.slice(0, 1)}</span>{/if}</span>
+       <span class="card-info"><span class="card-title">{item.title}</span><span class="card-artist">{item.subtitle || item.kind}</span></span>
+      </button>
+     {/each}
     </div>
-    <div class="skeleton-grid">
-      {#each Array(10) as _, i}
-        <div class="skeleton-card" style="--i: {i}">
-          <div class="skeleton-art"></div>
-          <div class="skeleton-line wide"></div>
-          <div class="skeleton-line"></div>
-        </div>
-      {/each}
+   </section>
+  {/each}
+ {/if}
+ {#if !browse}
+  <section class="section">
+   <div class="section-header"><h2 class="section-title">Public discovery</h2><button disabled={loading} onclick={loadPublic}>Load public music</button></div>
+   <p>Public discovery is separate from your YouTube Music personal home.</p>
+   {#each publicSections as section, si (si)}
+    <h3>{section.title}</h3><div class="card-grid">
+     {#each section.tracks as track, i (i)}
+      <button class="card" onclick={() => play(track)} oncontextmenu={e => ctxMenu.open(e, track)}>
+       <span class="art-shell">{#if track.thumbnail}<img class="card-thumb" src={track.thumbnail} alt="" loading="lazy" />{/if}</span>
+       <span class="card-info"><span class="card-title">{track.title}</span><span class="card-artist">{track.artist}</span></span>
+      </button>
+     {/each}
     </div>
-  </div>
-{:else if sections.length === 0}
-  <div class="empty-state">
-    <p class="empty-title"><WormText text="Nothing here yet" /></p>
-    <p class="empty-sub">Search and play some tracks to get personalized recommendations</p>
-  </div>
-{:else}
-  <div class="explore">
-    {#each sections as section}
-      <section class="section">
-        <div class="section-header">
-          <h2 class="section-title">{section.title}</h2>
-        </div>
-        <div class="card-grid" onwheel={handleShelfWheel}>
-          {#each section.tracks as track, i (track.id)}
-            <button
-              class="card"
-              class:active={isActive(track)}
-              onclick={() => handlePlay(track)}
-              oncontextmenu={(e) => handleContext(e, track)}
-              aria-label={`Play ${track.title} by ${track.artist}`}
-              style="--i: {i}"
-            >
-              <span class="art-shell">
-                {#if track.thumbnail}
-                  <img class="card-thumb" src={track.thumbnail} alt="" loading="lazy" />
-                {:else}
-                  <span class="art-fallback" aria-hidden="true">{fallbackInitial(track)}</span>
-                {/if}
-                <span class="art-shade" aria-hidden="true"></span>
-                <span class="play-puck" aria-hidden="true"><span class="play-triangle"></span></span>
-                {#if downloads.isDownloaded(track.id)}
-                  <span class="dl-badge" aria-label="Downloaded" use:tooltip={{ text: "Available offline", placement: "top" }}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                  </span>
-                {/if}
-                <span class="card-duration">{formatDuration(track.duration_secs)}</span>
-              </span>
-              <div class="card-info">
-                <span class="card-title">{track.title}</span>
-                <span class="card-artist">{track.artist}</span>
-              </div>
-            </button>
-          {/each}
-        </div>
-      </section>
-    {/each}
-  </div>
-{/if}
-
+   {/each}
+  </section>
+ {/if}
+</div>
 <style>
-  .loading {
-    display: flex;
-    flex-direction: column;
-    gap: 24px;
-    color: var(--text-muted);
-    animation: viewEnter 500ms var(--ease-out-expo);
-  }
-
-  .loading-header {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    color: var(--text-secondary);
-  }
-
-  .eq-loader {
-    display: flex;
-    align-items: flex-end;
-    gap: 4px;
-    height: 32px;
-  }
-
-  .eq-bar {
-    width: 4px;
-    height: 100%;
-    background: var(--accent);
-    border-radius: 2px;
-    transform-origin: bottom;
-    animation: eqBounce 1s ease-in-out infinite;
-  }
-
-  .eq-bar:nth-child(1) { animation-delay: 0ms; }
-  .eq-bar:nth-child(2) { animation-delay: 200ms; }
-  .eq-bar:nth-child(3) { animation-delay: 400ms; }
-  .eq-bar:nth-child(4) { animation-delay: 150ms; }
-
-  .skeleton-grid {
-    display: flex;
-    gap: 18px;
-    overflow: hidden;
-  }
-
-  .skeleton-card {
-    display: flex;
-    flex-direction: column;
-    flex: 0 0 180px;
-    gap: 10px;
-    animation: itemSlideUp 350ms var(--ease-out-expo) backwards;
-    animation-delay: calc(min(var(--i, 0), 10) * 30ms);
-  }
-
-  .skeleton-art,
-  .skeleton-line {
-    background: linear-gradient(90deg, var(--bg-elevated), var(--bg-overlay), var(--bg-elevated));
-    background-size: 200% 100%;
-    animation: shimmer 1.5s ease-in-out infinite;
-  }
-
-  .skeleton-art {
-    aspect-ratio: 1;
-    border-radius: var(--radius);
-  }
-
-  .skeleton-line {
-    height: 10px;
-    width: 62%;
-    border-radius: 999px;
-  }
-
-  .skeleton-line.wide { width: 88%; }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 60vh;
-    color: var(--text-muted);
-    animation: viewEnter 500ms var(--ease-out-expo);
-  }
-
-  .empty-title {
-    font-size: 1.2rem;
-    color: var(--text-secondary);
-    margin-bottom: 4px;
-  }
-
-  .empty-sub { font-size: 0.85rem; }
-
-  .explore {
-    display: flex;
-    flex-direction: column;
-    gap: 38px;
-    animation: viewEnter 400ms var(--ease-out-expo);
-  }
-
-  .section {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
-
-  .section-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .section-title {
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: var(--text-primary);
-  }
-
-  .card-grid {
-    display: flex;
-    gap: 18px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
-    scrollbar-color: var(--bg-overlay) transparent;
-    scroll-padding-inline: 28px;
-    padding: 4px 28px 14px;
-    margin: 0 -28px;
-  }
-
-  .card-grid::-webkit-scrollbar {
-    height: 6px;
-  }
-
-  .card-grid::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  .card-grid::-webkit-scrollbar-thumb {
-    background: var(--bg-overlay);
-    border-radius: 999px;
-  }
-
-  .card-grid::-webkit-scrollbar-thumb:hover {
-    background: var(--text-muted);
-  }
-
-  .card {
-    display: flex;
-    flex-direction: column;
-    flex: 0 0 184px;
-    gap: 10px;
-    min-width: 0;
-    padding: 10px;
-    border-radius: var(--radius);
-    border: 1px solid transparent;
-    background: rgba(255, 255, 255, 0.02);
-    transition: background 180ms ease, border-color 180ms ease, transform 180ms ease;
-    text-align: left;
-    width: 184px;
-    scroll-snap-align: start;
-    animation: itemSlideUp 350ms var(--ease-out-expo) backwards;
-    animation-delay: calc(min(var(--i, 0), 12) * 35ms);
-  }
-
-  .card:hover,
-  .card:focus-visible {
-    background: var(--bg-elevated);
-    border-color: var(--bg-overlay);
-    transform: translateY(-2px);
-    outline: none;
-  }
-
-  .card:active {
-    transform: translateY(0) scale(0.98);
-  }
-
-  .card.active {
-    background: rgba(212, 160, 23, 0.08);
-    border-color: rgba(212, 160, 23, 0.45);
-    position: relative;
-  }
-
-  .art-shell {
-    position: relative;
-    display: block;
-    width: 100%;
-    aspect-ratio: 1;
-    overflow: hidden;
-    border-radius: var(--radius);
-    background: var(--bg-overlay);
-    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
-  }
-
-  .card-thumb {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-    transition: transform 300ms var(--ease-out-expo);
-  }
-
-  .card:hover .card-thumb,
-  .card:focus-visible .card-thumb {
-    transform: scale(1.04);
-  }
-
-  .art-fallback {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 100%;
-    height: 100%;
-    color: var(--accent-light);
-    font-size: 3rem;
-    font-weight: 800;
-    background:
-      linear-gradient(135deg, rgba(212, 160, 23, 0.28), rgba(76, 175, 80, 0.14)),
-      var(--bg-overlay);
-  }
-
-  .art-shade {
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(180deg, rgba(0, 0, 0, 0.02) 35%, rgba(0, 0, 0, 0.72) 100%);
-    opacity: 0.72;
-    pointer-events: none;
-  }
-
-  .play-puck {
-    position: absolute;
-    right: 10px;
-    bottom: 10px;
-    width: 40px;
-    height: 40px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 50%;
-    background: var(--accent);
-    color: #111;
-    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.35);
-    opacity: 0;
-    transform: translateY(8px) scale(0.94);
-    transition: opacity 180ms ease, transform 180ms var(--ease-out-expo);
-  }
-
-  .card:hover .play-puck,
-  .card:focus-visible .play-puck,
-  .card.active .play-puck {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-
-  .play-triangle {
-    width: 0;
-    height: 0;
-    margin-left: 3px;
-    border-top: 8px solid transparent;
-    border-bottom: 8px solid transparent;
-    border-left: 12px solid currentColor;
-  }
-
-  .card-info {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-  }
-
-  .card-title {
-    font-size: 0.92rem;
-    font-weight: 650;
-    line-height: 1.25;
-    color: var(--text-primary);
-    display: -webkit-box;
-    line-clamp: 2;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    overflow-wrap: anywhere;
-    min-height: 2.3em;
-  }
-
-  .card-artist {
-    font-size: 0.8rem;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .card-duration {
-    position: absolute;
-    left: 10px;
-    bottom: 12px;
-    padding: 3px 7px;
-    border-radius: var(--radius-sm);
-    background: rgba(0, 0, 0, 0.55);
-    font-size: 0.8rem;
-    color: var(--text-primary);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .dl-badge {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    width: 22px;
-    height: 22px;
-    display: grid;
-    place-items: center;
-    border-radius: 50%;
-    background: var(--success);
-    color: #0e1a0e;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
-  }
-
-  .dl-badge svg {
-    width: 13px;
-    height: 13px;
-  }
-
-  @media (max-width: 700px) {
-    .explore { gap: 30px; }
-
-    .card-grid,
-    .skeleton-grid {
-      gap: 14px;
-    }
-
-    .card-grid {
-      scroll-padding-inline: 18px;
-      padding-inline: 18px;
-      margin-inline: -18px;
-    }
-
-    .card,
-    .skeleton-card {
-      flex-basis: 148px;
-      width: 148px;
-    }
-
-    .card { padding: 8px; }
-    .play-puck { width: 34px; height: 34px; }
-    .art-fallback { font-size: 2.4rem; }
-  }
+ .explore { display: flex; flex-direction: column; gap: 32px; animation: viewEnter 400ms var(--ease-out-expo); }
+ .section { display: flex; flex-direction: column; gap: 14px; }
+ .section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+ .section-title { font-size: 1.1rem; font-weight: 700; }
+ .card-grid { display: flex; gap: 18px; overflow-x: auto; padding: 4px 0 14px; }
+ .card { flex: 0 0 184px; display: flex; flex-direction: column; gap: 10px; padding: 10px; text-align: left; border: 1px solid transparent; border-radius: var(--radius); background: rgba(255,255,255,.02); color: var(--text-primary); }
+ .card:hover, .card:focus-visible { background: var(--bg-elevated); border-color: var(--bg-overlay); }
+ .art-shell { display: block; width: 100%; aspect-ratio: 1; overflow: hidden; border-radius: var(--radius); background: var(--bg-overlay); }
+ .card-thumb { width: 100%; height: 100%; object-fit: cover; }
+ .art-fallback { height: 100%; display: grid; place-items: center; color: var(--accent); font-size: 3rem; }
+ .card-info { display: flex; flex-direction: column; gap: 4px; }
+ .card-title { font-size: .92rem; font-weight: 650; overflow-wrap: anywhere; }
+ .card-artist { font-size: .8rem; color: var(--text-secondary); }
+ .browse-list { display: flex; flex-direction: column; gap: 8px; }
+ .browse-list button { display: flex; justify-content: space-between; padding: 12px; background: var(--bg-elevated); color: var(--text-primary); border-radius: var(--radius-sm); text-align: left; gap: 16px; }
+ .unavailable { opacity: .45; }
+ .section-header > button, .section > button { background: var(--bg-elevated); padding: 10px 16px; color: var(--accent); border-radius: var(--radius-sm); }
+ p { color: var(--text-secondary); }
+ @media (max-width: 700px) { .card { flex-basis: 148px; } }
 </style>

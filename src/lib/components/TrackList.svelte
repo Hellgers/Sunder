@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isPlayable } from "../util/tracks";
   import { onMount } from "svelte";
   import { playTrack } from "../ipc/bridge";
   import { player } from "../state/player.svelte";
@@ -68,10 +69,10 @@
     </div>
   {/if}
   <div class="track-list">
-    {#each tracks as track, i (track.id)}
+    {#each tracks as track, i (i)}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
-        class="track-row drag-row"
+        class="track-row drag-row" class:unavailable={!isPlayable(track)}
         class:active={isActive(track)}
         class:is-dragging={reorder.isDragging(i)}
         class:drop-before={reorder.dragOver === i && reorder.dropPosition === "before" && reorder.dragFrom !== i}
@@ -91,10 +92,10 @@
           active={isActive(track)}
           playing={player.isPlaying}
         />
-        <button class="track-play" onclick={() => handlePlay(track)}>
+        <button class="track-play" disabled={!isPlayable(track)} onclick={() => handlePlay(track)}>
           <div class="track-info">
             <span class="track-title">{track.title}</span>
-            <span class="track-artist">{track.artist}</span>
+            <span class="track-artist">{isPlayable(track) ? track.artist : "Unavailable - preserved in order"}</span>
           </div>
           <span class="track-duration">{formatDuration(track.duration_secs)}</span>
         </button>
@@ -113,6 +114,7 @@
 {/if}
 
 <style>
+  .unavailable { opacity: .45; }
   .empty-state {
     display: flex;
     flex-direction: column;

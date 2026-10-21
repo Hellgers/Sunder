@@ -1,9 +1,10 @@
 <script lang="ts">
+  import { isPlayable } from "../util/tracks";
   import { onMount } from "svelte";
   import { fly } from "svelte/transition";
   import { flip } from "svelte/animate";
   import { quintOut } from "svelte/easing";
-  import { playTrack, createPlaylist, addToPlaylist } from "../ipc/bridge";
+  import { playTrack, savePlaylistTracks } from "../ipc/bridge";
   import { player } from "../state/player.svelte";
   import { nav } from "../state/nav.svelte";
   import { toastState } from "../state/toast.svelte";
@@ -147,11 +148,8 @@
     if (!name || saving) return;
     saving = true;
     try {
-      const playlist = await createPlaylist(name);
-      for (const track of queue) {
-        await addToPlaylist(playlist.id, track.id);
-      }
-      toastState.add(`Saved "${name}" with ${queue.length} tracks`, "info", 4000);
+      const playlist = await savePlaylistTracks(name, [...queue]);
+      toastState.add(`Saved "${playlist.name}" with ${playlist.track_count} tracks`, "info", 4000);
       savingAsPlaylist = false;
       newPlaylistName = "";
     } catch (e) {
@@ -161,9 +159,9 @@
     }
   }
 
-  function handleContext(e: MouseEvent, track: Track) {
+  function handleContext(e: MouseEvent, track: Track, position: number) {
     if (reorder.busy() || reorder.justDragged()) return;
-    ctxMenu.open(e, track);
+    ctxMenu.open(e, track, position);
   }
 
   /**
@@ -294,7 +292,7 @@
           <button
             class="track-play np-track"
             onclick={() => handlePlay(currentIndex)}
-            oncontextmenu={(e) => handleContext(e, nowPlaying)}
+            oncontextmenu={(e) => handleContext(e, nowPlaying, currentIndex)}
           >
             <div class="track-info">
               <span class="track-title np-title">{nowPlaying.title}</span>
@@ -336,12 +334,12 @@
         {#if upNextSlice.start > 0}
           <div style="height: {upNextSlice.start * ROW_HEIGHT}px" aria-hidden="true"></div>
         {/if}
-        {#each upNext.slice(upNextSlice.start, upNextSlice.end) as track, i (track.id)}
+        {#each upNext.slice(upNextSlice.start, upNextSlice.end) as track, i (i)}
           {@const ri = upNextSlice.start + i}
           {@const queueIdx = currentIndex + 1 + ri}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="track-row drag-row"
+            class="track-row drag-row" class:unavailable={!isPlayable(track)}
             class:is-dragging={reorder.isDragging(queueIdx)}
             class:is-key-drag={reorder.isDragging(queueIdx)}
             class:drop-before={reorder.dragOver === queueIdx && reorder.dropPosition === "before" && !reorder.isDragging(queueIdx)}
@@ -351,7 +349,7 @@
             style="--i: {ri}"
             onpointerdown={(e) => reorder.onPointerDown(e, queueIdx)}
             onpointercancel={() => reorder.onPointerCancel()}
-            oncontextmenu={(e) => { e.preventDefault(); handleContext(e, track); }}
+            oncontextmenu={(e) => { e.preventDefault(); handleContext(e, track, queueIdx); }}
             animate:flip={{ duration: 260, easing: quintOut }}
           >
             <button
@@ -367,13 +365,13 @@
             <span class="track-num" onclick={(e) => { e.stopPropagation(); handleKeyActivate("upNext", ri); }} onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleKeyActivate("upNext", ri); } }} role="button" tabindex="-1">{dragProjection?.get(queueIdx) ?? ri + 1}</span>
             <TrackArt {track} onplay={() => handlePlay(queueIdx)} size={40} />
             <button
-              class="track-play"
+              class="track-play" disabled={!isPlayable(track)}
               onclick={() => handlePlay(queueIdx)}
-              oncontextmenu={(e) => handleContext(e, track)}
+              oncontextmenu={(e) => handleContext(e, track, queueIdx)}
             >
               <div class="track-info">
                 <span class="track-title">{track.title}</span>
-                <span class="track-artist">{track.artist}</span>
+                <span class="track-artist">{isPlayable(track) ? track.artist : "Unavailable - preserved in order"}</span>
               </div>
               <span class="track-duration">{formatDuration(track.duration_secs)}</span>
             </button>
@@ -396,11 +394,11 @@
         {#if playedSlice.start > 0}
           <div style="height: {playedSlice.start * ROW_HEIGHT}px" aria-hidden="true"></div>
         {/if}
-        {#each played.slice(playedSlice.start, playedSlice.end) as track, i (track.id)}
+        {#each played.slice(playedSlice.start, playedSlice.end) as track, i (i)}
           {@const ri = playedSlice.start + i}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="track-row drag-row played-row"
+            class="track-row drag-row played-row" class:unavailable={!isPlayable(track)}
             class:is-dragging={reorder.isDragging(ri)}
             class:is-key-drag={reorder.isDragging(ri)}
             class:drop-before={reorder.dragOver === ri && reorder.dropPosition === "before" && !reorder.isDragging(ri)}
@@ -410,7 +408,7 @@
             style="--i: {ri}"
             onpointerdown={(e) => reorder.onPointerDown(e, ri)}
             onpointercancel={() => reorder.onPointerCancel()}
-            oncontextmenu={(e) => { e.preventDefault(); handleContext(e, track); }}
+            oncontextmenu={(e) => { e.preventDefault(); handleContext(e, track, ri); }}
             animate:flip={{ duration: 260, easing: quintOut }}
           >
             <button
@@ -426,13 +424,13 @@
             <span class="track-num" onclick={(e) => { e.stopPropagation(); handleKeyActivate("played", ri); }} onkeydown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handleKeyActivate("played", ri); } }} role="button" tabindex="-1">{dragProjection?.get(ri) ?? ri + 1}</span>
             <TrackArt {track} onplay={() => handlePlay(ri)} size={40} />
             <button
-              class="track-play"
+              class="track-play" disabled={!isPlayable(track)}
               onclick={() => handlePlay(ri)}
-              oncontextmenu={(e) => handleContext(e, track)}
+              oncontextmenu={(e) => handleContext(e, track, ri)}
             >
               <div class="track-info">
                 <span class="track-title">{track.title}</span>
-                <span class="track-artist">{track.artist}</span>
+                <span class="track-artist">{isPlayable(track) ? track.artist : "Unavailable - preserved in order"}</span>
               </div>
               <span class="track-duration">{formatDuration(track.duration_secs)}</span>
             </button>
@@ -452,6 +450,7 @@
 </div>
 
 <style>
+  .unavailable { opacity: .45; }
   .queue-view {
     display: flex;
     flex-direction: column;

@@ -3,6 +3,7 @@
   import Sidebar from "./lib/components/Sidebar.svelte";
   import SearchBar from "./lib/components/SearchBar.svelte";
   import TrackList from "./lib/components/TrackList.svelte";
+  import YouTubeAccount from "./lib/components/YouTubeAccount.svelte";
   import Explore from "./lib/components/Explore.svelte";
   import PlaylistView from "./lib/components/PlaylistView.svelte";
   import QueueView from "./lib/components/QueueView.svelte";
@@ -135,6 +136,8 @@
           </div>
         {:else if nav.activeTab === "explore"}
           <Explore />
+        {:else if nav.activeTab === "account"}
+          <YouTubeAccount />
         {:else if nav.activeTab === "queue"}
           <QueueView />
         {:else if nav.activeTab === "downloads"}

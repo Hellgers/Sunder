@@ -8,13 +8,14 @@ mod extraction;
 mod ipc;
 pub mod models;
 mod process;
+mod ytmusic;
 
-use tauri::{Emitter, Manager};
 use crate::config::ConfigManager;
 use audio::AudioHandle;
 use db::SearchCache;
 use downloads::DownloadManager;
 use extraction::Extractor;
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,6 +33,7 @@ pub fn run() {
 
             app.manage(AudioHandle::new(app.handle().clone()));
             app.manage(Extractor::new(&data_dir));
+            app.manage(ytmusic::YouTubeMusic::new(&data_dir));
             app.manage(DownloadManager::new(&data_dir));
 
             let config_mgr = ConfigManager::new(&data_dir);
@@ -42,9 +44,10 @@ pub fn run() {
 
             // System Tray Setup
             use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-            use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton};
+            use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 
-            let play_pause = MenuItem::with_id(app, "play_pause", "Play / Pause", true, None::<&str>)?;
+            let play_pause =
+                MenuItem::with_id(app, "play_pause", "Play / Pause", true, None::<&str>)?;
             let next = MenuItem::with_id(app, "next", "Next Track", true, None::<&str>)?;
             let prev = MenuItem::with_id(app, "prev", "Previous Track", true, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
@@ -66,34 +69,36 @@ pub fn run() {
 
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .on_menu_event(|app: &tauri::AppHandle, event| {
-                    match event.id.as_ref() {
-                        "play_pause" => {
-                            let _ = app.emit("media-toggle", ());
-                        }
-                        "next" => {
-                            let _ = app.emit("media-next", ());
-                        }
-                        "prev" => {
-                            let _ = app.emit("media-previous", ());
-                        }
-                        "show" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
-                        }
-                        "restart" => {
-                            app.restart();
-                        }
-                        "exit" => {
-                            app.exit(0);
-                        }
-                        _ => {}
+                .on_menu_event(|app: &tauri::AppHandle, event| match event.id.as_ref() {
+                    "play_pause" => {
+                        let _ = app.emit("media-toggle", ());
                     }
+                    "next" => {
+                        let _ = app.emit("media-next", ());
+                    }
+                    "prev" => {
+                        let _ = app.emit("media-previous", ());
+                    }
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "restart" => {
+                        app.restart();
+                    }
+                    "exit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
                 })
                 .on_tray_icon_event(|tray: &tauri::tray::TrayIcon, event| {
-                    if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
                         if let Some(window) = tray.app_handle().get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
@@ -112,6 +117,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            ytmusic::commands::ytmusic_status,
+            ytmusic::commands::ytmusic_import_browser_headers,
+            ytmusic::commands::ytmusic_connect,
+            ytmusic::commands::ytmusic_poll_login,
+            ytmusic::commands::ytmusic_disconnect,
+            ytmusic::commands::ytmusic_home,
+            ytmusic::commands::ytmusic_radio,
+            ytmusic::commands::ytmusic_import_library,
+            ytmusic::commands::ytmusic_imported_playlist_ids,
+            ytmusic::commands::ytmusic_browse,
             ipc::commands::search,
             ipc::commands::search_local,
             ipc::commands::play_track,
@@ -128,6 +143,7 @@ pub fn run() {
             ipc::commands::seek,
             ipc::commands::get_playback_state,
             ipc::commands::create_playlist,
+            ipc::commands::save_playlist_tracks,
             ipc::commands::list_playlists,
             ipc::commands::delete_playlist,
             ipc::commands::rename_playlist,

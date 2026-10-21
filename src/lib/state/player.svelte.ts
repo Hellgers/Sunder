@@ -1,5 +1,6 @@
-import type { Track, PlaybackProgress } from "../types";
-import { prefetchTrack, setRepeatMode, stop, getTracksByIds } from "../ipc/bridge";
+import { isPlayable, playableIndex } from "../util/tracks";
+import type { PlaybackQuality, Track, PlaybackProgress } from "../types";
+import { prefetchTrack, setRepeatMode, stop, getTracksByIds, playTrack } from "../ipc/bridge";
 
 const PREFETCH_AHEAD = 2;
 /** Context tracks materialized into the queue ahead of the current one. */
@@ -32,6 +33,7 @@ export interface PlaybackContext {
 }
 
 class PlayerState {
+  quality = $state<PlaybackQuality | null>(null);
   currentTrack = $state<Track | null>(null);
   isPlaying = $state(false);
   isBuffering = $state(false);
@@ -88,15 +90,15 @@ class PlayerState {
     return !!ctx && !ctx.suspended && ctx.index + 1 < ctx.order.length;
   });
   hasNext = $derived(
-    this.queueIndex < this.queue.length - 1 ||
-      (this.repeatMode === "queue" && this.queue.length > 0) ||
+    playableIndex(this.queue, this.queueIndex + 1, 1) >= 0 ||
+      (this.repeatMode === "queue" && playableIndex(this.queue, 0, 1) >= 0) ||
       this.contextHasNext,
   );
   hasPrev = $derived.by(() => {
     const ctx = this.playbackContext;
     return (
-      this.queueIndex > 0 ||
-      (this.repeatMode === "queue" && this.queue.length > 0) ||
+      playableIndex(this.queue, this.queueIndex - 1, -1) >= 0 ||
+      (this.repeatMode === "queue" && playableIndex(this.queue, 0, 1) >= 0) ||
       (!!ctx && ctx.index > 0)
     );
   });
@@ -127,15 +129,14 @@ class PlayerState {
   prefetchAhead(fromIndex: number) {
     for (let i = 1; i <= PREFETCH_AHEAD; i++) {
       const track = this.queue[fromIndex + i];
-      if (track) prefetchTrack(track.id).catch(() => {});
+      if (isPlayable(track)) prefetchTrack(track.id).catch(() => {});
     }
   }
 
   addToQueue(track: Track) {
-    if (!this.queue.some((t) => t.id === track.id)) {
-      this.queueEpoch++;
-      this.queue = [...this.queue, track];
-    }
+    if (!isPlayable(track)) return;
+    this.queueEpoch++;
+    this.queue = [...this.queue, track];
   }
 
   setQueue(tracks: Track[]) {
@@ -296,13 +297,13 @@ class PlayerState {
     if (this.playbackContext?.order.includes(track.id)) {
       this.contextBypass.add(track.id);
     }
-    const filtered = this.queue.filter((t) => t.id !== track.id);
+    if (!isPlayable(track)) return;
+    const filtered = [...this.queue];
     const insertAt = this.queueIndex + 1;
     filtered.splice(insertAt, 0, track);
     this.queue = [...filtered];
-    if (this.currentTrack) {
-      this.queueIndex = filtered.findIndex((t) => t.id === this.currentTrack!.id);
-    }
+    // Insertion is after the current occurrence, so its index stays stable
+    // even when the same video occurs earlier in the queue.
     this.ensureNext();
   }
 
@@ -377,7 +378,7 @@ class PlayerState {
   }
 
   playFromQueue(index: number) {
-    if (index >= 0 && index < this.queue.length) {
+    if (index >= 0 && index < this.queue.length && isPlayable(this.queue[index])) {
       this.queueIndex = index;
       const track = this.queue[index];
       // An explicit click is a clear statement of intent: drop any stale
@@ -388,7 +389,7 @@ class PlayerState {
       this.resyncContextForTrack(track?.id ?? null);
       this.ensureNext();
       this.prefetchAhead(index);
-      return track;
+      return track ?? null;
     }
     return null;
   }
@@ -397,8 +398,9 @@ class PlayerState {
     if (!manual && this.repeatMode === "track") {
       return this.queue[this.queueIndex] ?? null;
     }
-    if (this.queueIndex < this.queue.length - 1) {
-      this.queueIndex++;
+    const nextIndex = playableIndex(this.queue, this.queueIndex + 1, 1);
+    if (nextIndex >= 0) {
+      this.queueIndex = nextIndex;
       const track = this.queue[this.queueIndex];
       this.resyncContextForTrack(track?.id ?? null);
       this.ensureNext();
@@ -430,13 +432,13 @@ class PlayerState {
       }
       return null;
     }
-    if (this.repeatMode === "queue" && this.queue.length > 0) {
-      this.queueIndex = 0;
-      const track = this.queue[0];
+    if (this.repeatMode === "queue" && playableIndex(this.queue, 0, 1) >= 0) {
+      this.queueIndex = playableIndex(this.queue, 0, 1);
+      const track = this.queue[this.queueIndex];
       this.resyncContextForTrack(track?.id ?? null);
       this.ensureNext();
       this.prefetchAhead(0);
-      return track;
+      return track ?? null;
     }
     return null;
   }
@@ -456,15 +458,16 @@ class PlayerState {
     if (!manual && this.repeatMode === "track") {
       return this.queue[this.queueIndex] ?? null;
     }
-    if (this.queueIndex > 0) {
-      this.queueIndex--;
+    const previousIndex = playableIndex(this.queue, this.queueIndex - 1, -1);
+    if (previousIndex >= 0) {
+      this.queueIndex = previousIndex;
       const track = this.queue[this.queueIndex];
       this.resyncContextForTrack(track?.id ?? null);
       this.ensureNext();
       return track ?? null;
     }
-    if (this.repeatMode === "queue" && this.queue.length > 0) {
-      this.queueIndex = this.queue.length - 1;
+    if (this.repeatMode === "queue" && playableIndex(this.queue, 0, 1) >= 0) {
+      this.queueIndex = playableIndex(this.queue, this.queue.length - 1, -1);
       const track = this.queue[this.queueIndex];
       this.resyncContextForTrack(track?.id ?? null);
       this.ensureNext();
@@ -513,10 +516,12 @@ class PlayerState {
         void this.stopFromQueue();
         return;
       }
-      if (index < this.queue.length) {
-        // Case 1: a next track exists at the same slot after removal.
-        const next = this.queue[index];
-        this.currentTrack = next;
+      const replacementIndex = playableIndex(this.queue, index, 1);
+      if (replacementIndex >= 0) {
+        // Play the occurrence shifted into the removed slot, skipping missing
+        // entries without advancing past a playable replacement.
+        this.queueIndex = replacementIndex;
+        this.currentTrack = this.queue[replacementIndex];
         void this.skipFromQueue();
       } else {
         // Case 2: last track - clamp, keep playing out, stop at end.
@@ -541,9 +546,9 @@ class PlayerState {
 
   /**
    * Async companion to removeFromQueue's case 1: load the track that now sits
-   * at queueIndex through the bridge's skip path (playNext(true) semantics),
-   * so the lazy playlist context fallback resolves it exactly like the Next
-   * button does. Injectable for dev harnesses.
+   * at queueIndex through the bridge. This slot already advanced when the
+   * removed row was spliced; advancing again would skip its replacement.
+   * Injectable for dev harnesses.
    */
   skipFromQueue: () => Promise<void> = async () => {};
 
@@ -723,12 +728,13 @@ export const player = new PlayerState();
 
 // Default companions for removeFromQueue's current-removal cases. Defined
 // after the singleton (they close over it) and routed through the bridge so
-// the skip uses playNext(true) semantics - lazy playlist context fallback
-// included - and the stop clears currentTrack + state exactly like the
-// transport's stop.
+// the replacement occurrence loads exactly once, and stop clears currentTrack
+// like the transport's stop.
 player.skipFromQueue = async () => {
-  const { playNext } = await import("../ipc/bridge");
-  await playNext(true);
+  const index = playableIndex(player.queue, player.queueIndex, 1);
+  if (index < 0) { await stop(); return; }
+  const track = player.playFromQueue(index);
+  if (track) await playTrack(track);
 };
 player.stopFromQueue = () => stop();
 

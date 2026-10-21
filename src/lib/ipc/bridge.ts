@@ -1,3 +1,5 @@
+import { isPlayable, playableIndex } from "../util/tracks";
+import type { PlaybackQuality, YtmHome, YtmDeviceCode, YtmImportReport, YtmConnectionStatus } from "../types";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -25,11 +27,13 @@ export async function refreshYtPlaylist(playlistId: number): Promise<number> {
 }
 
 export async function playTrack(track: Track): Promise<void> {
+  if (!isPlayable(track)) return;
+  player.quality = null;
   player.currentTrack = track;
   player.isBuffering = true;
   player.downloadPercent = 0;
   player.downloadStage = "preparing";
-  const idx = player.queue.findIndex((t) => t.id === track.id);
+  const idx = player.queue[player.queueIndex]?.id === track.id ? player.queueIndex : player.queue.findIndex((t) => t === track);
   if (idx !== -1) {
     player.queueIndex = idx;
   } else {
@@ -116,6 +120,7 @@ export async function seek(positionSecs: number): Promise<void> {
 }
 
 export async function prefetchTrack(trackId: string): Promise<void> {
+  if (trackId.startsWith("unavailable:")) return;
   await invoke("prefetch_track", { trackId });
 }
 
@@ -235,11 +240,12 @@ export async function getTracksByIds(trackIds: string[]): Promise<Track[]> {
 }
 
 export async function downloadTrack(trackId: string): Promise<void> {
+  if (trackId.startsWith("unavailable:")) return;
   await invoke("download_track", { trackId });
 }
 
 export async function downloadTracks(trackIds: string[]): Promise<void> {
-  await invoke("download_tracks", { trackIds });
+  await invoke("download_tracks", { trackIds: trackIds.filter(id => !id.startsWith("unavailable:")) });
 }
 
 export async function downloadPlaylist(playlistId: number): Promise<void> {
@@ -341,7 +347,7 @@ export function openUrl(url: string): Promise<void> {
 }
 
 export interface YtdlpStatus {
-  source: "override" | "managed" | "system";
+  source: "override" | "managed" | "portable" | "system";
   path: string;
   version: string | null;
   /** One-click update offered (Linux, no env override). Gates the button. */
@@ -368,8 +374,12 @@ export function initProgressListener(): () => void {
   let unlistenNext: (() => void) | undefined;
   let unlistenPrev: (() => void) | undefined;
   let unlistenToggle: (() => void) | undefined;
+  let unlistenQuality: (() => void) | undefined;
   let unlistenTrackDownload: (() => void) | undefined;
 
+  listen<PlaybackQuality>("playback-quality", (event) => {
+    if (event.payload.video_id === player.currentTrack?.id) player.quality = event.payload;
+  }).then((fn) => { unlistenQuality = fn; });
   listen<PlaybackProgress>("playback-progress", (event) => {
     player.updateFromProgress(event.payload);
   }).then((fn) => { unlistenProgress = fn; });
@@ -438,6 +448,7 @@ export function initProgressListener(): () => void {
   }).then((fn) => { unlistenToggle = fn; });
 
   return () => {
+    unlistenQuality?.();
     unlistenProgress?.();
     unlistenDownload?.();
     unlistenFinished?.();
@@ -614,4 +625,39 @@ function cleanForSearch(artist: string, title: string) {
   cleanTitle = cleanTitle.replace(/Official Video|Official Audio|Music Video|LYRICS/gi, "").trim();
   const cleanArtist = artist.replace(/ - Topic$/i, "").trim();
   return { cleanArtist, cleanTitle };
+}
+
+export const ytmusicStatus = () => invoke<YtmConnectionStatus>("ytmusic_status");
+/** Only the selected path crosses IPC; the native app reads and verifies the file. */
+export async function ytmusicConnectBrowserFile(): Promise<YtmConnectionStatus | null> {
+ const path = await open({
+  title: "Connect YouTube Music browser session",
+  multiple: false,
+  directory: false,
+  filters: [{name: "Browser request headers", extensions: ["txt", "json", "js"]}],
+ });
+ if (typeof path !== "string") return null;
+ return invoke<YtmConnectionStatus>("ytmusic_import_browser_headers", {path});
+}
+export const ytmusicConnect = (clientId: string, clientSecret: string) => invoke<YtmDeviceCode>("ytmusic_connect", {clientId, clientSecret});
+export const ytmusicPollLogin = () => invoke<{status: "pending" | "connected" | "slow_down"; interval: number}>("ytmusic_poll_login");
+export const ytmusicDisconnect = () => invoke<void>("ytmusic_disconnect");
+export const ytmusicHome = () => invoke<YtmHome>("ytmusic_home");
+export const ytmusicBrowse = (browseId: string) => invoke<{title: string; tracks: Track[]}>("ytmusic_browse", {browseId});
+export const ytmusicImportLibrary = () => invoke<YtmImportReport>("ytmusic_import_library");
+export async function startRadio(track: Track): Promise<void> {
+ if (!isPlayable(track)) return;
+ const tracks = await invoke<Track[]>("ytmusic_radio", {videoId: track.id});
+ const index = playableIndex(tracks, 0, 1);
+ if (index < 0) throw new Error("YouTube Music returned no playable radio tracks");
+ player.setQueue(tracks);
+ const first = player.playFromQueue(index);
+ if (first) await playTrack(first);
+}
+
+export const ytmusicImportedPlaylistIds = () => invoke<number[]>("ytmusic_imported_playlist_ids");
+
+/** Save the ordered queue atomically, including repeated and unavailable entries. */
+export function savePlaylistTracks(name: string, tracks: Track[]): Promise<Playlist> {
+  return invoke<Playlist>("save_playlist_tracks", { name, tracks });
 }

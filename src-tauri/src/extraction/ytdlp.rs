@@ -2,8 +2,9 @@
 //!
 //! Resolution order (single source of truth for every spawn site):
 //!   1. `SUNDER_YTDLP_PATH` env: explicit user override, always wins
-//!   2. `<app_data>/bin/yt-dlp`: the app-managed copy (see [`update`])
-//!   3. `"yt-dlp"`: system PATH lookup
+//!   2. `<app_data>/bin/yt-dlp[.exe]`: the app-managed copy (see [`update`])
+//!   3. `yt-dlp[.exe]` beside the running app: portable installation
+//!   4. `"yt-dlp"`: system PATH lookup
 //!
 //! The managed copy exists only because the user clicked "Update yt-dlp" in
 //! the UI. Sunder never downloads anything without that explicit action.
@@ -26,9 +27,9 @@ use crate::process::NoWindow;
 /// (the *nix Python zipapp, which is the reason the updater is Linux-gated).
 pub const RELEASE_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
 
-/// Location of the app-managed binary: `<data_dir>/bin/yt-dlp`.
+/// Location of the app-managed binary, with the native executable extension.
 pub fn managed_bin_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("bin").join("yt-dlp")
+    data_dir.join("bin").join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" })
 }
 
 fn is_executable_file(p: &Path) -> bool {
@@ -49,6 +50,14 @@ fn is_executable_file(p: &Path) -> bool {
     }
 }
 
+fn installed_bin(managed: Option<&Path>, app_dir: Option<&Path>) -> Option<(&'static str, PathBuf)> {
+    if let Some(path) = managed.filter(|path| is_executable_file(path)) {
+        return Some(("managed", path.to_path_buf()));
+    }
+    let sibling = app_dir?.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+    is_executable_file(&sibling).then_some(("portable", sibling))
+}
+
 /// Resolve which yt-dlp binary to spawn, in the documented order.
 pub fn resolve_bin(managed: Option<&Path>) -> String {
     if let Ok(p) = std::env::var("SUNDER_YTDLP_PATH") {
@@ -56,10 +65,9 @@ pub fn resolve_bin(managed: Option<&Path>) -> String {
             return p;
         }
     }
-    if let Some(p) = managed {
-        if is_executable_file(p) {
-            return p.to_string_lossy().into_owned();
-        }
+    let executable = std::env::current_exe().ok();
+    if let Some((_, path)) = installed_bin(managed, executable.as_deref().and_then(Path::parent)) {
+        return path.to_string_lossy().into_owned();
     }
     "yt-dlp".into()
 }
@@ -69,6 +77,27 @@ pub fn resolve_bin_for(app: &tauri::AppHandle) -> String {
     use tauri::Manager;
     let managed = app.path().app_data_dir().ok().map(|d| managed_bin_path(&d));
     resolve_bin(managed.as_deref())
+}
+
+/// Decode with an explicitly configured ffmpeg, its yt-dlp sibling, an app
+/// sibling, or PATH. This also supports a portable Windows installation.
+pub fn resolve_ffmpeg_for(app: &tauri::AppHandle) -> String {
+    if let Ok(path) = std::env::var("SUNDER_FFMPEG_PATH") {
+        if !path.trim().is_empty() { return path; }
+    }
+    let filename = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let ytdlp = resolve_bin_for(app);
+    if let Some(parent) = Path::new(&ytdlp).parent() {
+        let sibling = parent.join(filename);
+        if is_executable_file(&sibling) { return sibling.to_string_lossy().into_owned(); }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let sibling = parent.join(filename);
+            if is_executable_file(&sibling) { return sibling.to_string_lossy().into_owned(); }
+        }
+    }
+    filename.into()
 }
 
 /// Run `<bin> --version` and return the single-line version string.
@@ -93,7 +122,7 @@ pub async fn version_of(bin: &str) -> Option<String> {
 
 #[derive(serde::Serialize)]
 pub struct YtdlpStatus {
-    /// "override" (env var) | "managed" (app-data copy) | "system" (PATH)
+    /// "override" (env var) | "managed" (app-data) | "portable" (app sibling) | "system" (PATH)
     pub source: String,
     pub path: String,
     pub version: Option<String>,
@@ -132,10 +161,11 @@ pub async fn status(data_dir: &Path) -> YtdlpStatus {
         }
     }
     let managed = managed_bin_path(data_dir);
-    if is_executable_file(&managed) {
-        let p = managed.to_string_lossy().into_owned();
+    let executable = std::env::current_exe().ok();
+    if let Some((source, path)) = installed_bin(Some(&managed), executable.as_deref().and_then(Path::parent)) {
+        let p = path.to_string_lossy().into_owned();
         return YtdlpStatus {
-            source: "managed".into(),
+            source: source.into(),
             version: version_of(&p).await,
             path: p,
             can_update: update_capable(),
@@ -183,7 +213,7 @@ pub async fn update(data_dir: &Path) -> Result<String, String> {
 async fn do_update(data_dir: &Path) -> Result<String, String> {
     let bin_dir = data_dir.join("bin");
     std::fs::create_dir_all(&bin_dir).map_err(|e| format!("failed to create bin dir: {e}"))?;
-    let final_path = bin_dir.join("yt-dlp");
+    let final_path = managed_bin_path(data_dir);
     let tmp_path = bin_dir.join(format!("yt-dlp.download-{}", std::process::id()));
     // Clear any stale partial from a previously crashed attempt.
     let _ = std::fs::remove_file(&tmp_path);
@@ -252,6 +282,31 @@ async fn do_update(data_dir: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_resolution_prefers_managed_then_portable() {
+        let dir = std::env::temp_dir().join(format!("sunder-test-installed-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let managed = managed_bin_path(&dir);
+        let portable = dir.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+        let make_executable = |path: &Path| {
+            std::fs::write(path, b"stub").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        assert!(installed_bin(Some(&managed), Some(&dir)).is_none());
+        make_executable(&portable);
+        assert_eq!(installed_bin(Some(&managed), Some(&dir)), Some(("portable", portable.clone())));
+        make_executable(&managed);
+        assert_eq!(installed_bin(Some(&managed), Some(&dir)), Some(("managed", managed.clone())));
+        std::fs::remove_file(managed).unwrap();
+        std::fs::remove_file(portable).unwrap();
+        std::fs::remove_dir(dir.join("bin")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn resolve_prefers_env_over_managed_over_system() {

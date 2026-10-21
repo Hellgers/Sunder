@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { listPlaylists, addToPlaylist, removeFromPlaylist, playlistsContainingTrack, downloadTrack, deleteDownload } from "../ipc/bridge";
+  import { isPlayable } from "../util/tracks";
+  import { startRadio, ytmusicImportedPlaylistIds, listPlaylists, addToPlaylist, removeFromPlaylist, playlistsContainingTrack, downloadTrack, deleteDownload } from "../ipc/bridge";
   import { player } from "../state/player.svelte";
   import { nav } from "../state/nav.svelte";
   import { toastState } from "../state/toast.svelte";
@@ -7,12 +8,13 @@
   import { suppressTooltips, unsuppressTooltips } from "../util/tooltip.svelte";
   import type { Playlist, Track } from "../types";
 
-  let { onRemoveFromPlaylist = undefined }: { onRemoveFromPlaylist?: (trackId: string) => void } = $props();
+  let { onRemoveFromPlaylist = undefined, readOnly = false }: { onRemoveFromPlaylist?: (trackId: string) => void; readOnly?: boolean } = $props();
 
   let visible = $state(false);
   let x = $state(0);
   let y = $state(0);
   let track = $state<Track | null>(null);
+  let queuePosition = $state<number | undefined>();
   let playlists = $state<Playlist[]>([]);
   let showPlaylists = $state(false);
   let trackPlaylistIds = $state<Set<number>>(new Set());
@@ -22,10 +24,12 @@
   let isDownloaded = $derived(track !== null && downloads.isDownloaded(track.id));
   let isDownloading = $derived(track !== null && downloads.isActive(track.id));
 
-  export function open(e: MouseEvent, t: Track) {
+  export function open(e: MouseEvent, t: Track, position?: number) {
     e.preventDefault();
     e.stopPropagation();
+    if (!isPlayable(t)) return;
     track = t;
+    queuePosition = position;
     showPlaylists = false;
 
     const vw = window.innerWidth;
@@ -42,6 +46,13 @@
     unsuppressTooltips("ctxmenu");
   }
 
+  async function handleRadio() {
+    const seed = track;
+    close();
+    if (!seed) return;
+    try { await startRadio(seed); }
+    catch (e) { toastState.add(`Radio failed: ${e}`, "error"); }
+  }
   function handlePlayNext() {
     if (!track) return;
     player.playNext(track);
@@ -58,11 +69,12 @@
 
   async function expandPlaylists() {
     try {
-      const [pls, ids] = await Promise.all([
+      const [pls, ids, imported] = await Promise.all([
         listPlaylists(),
         track ? playlistsContainingTrack(track.id) : Promise.resolve([]),
+        ytmusicImportedPlaylistIds(),
       ]);
-      playlists = pls;
+      playlists = pls.filter(p => !imported.includes(p.id));
       trackPlaylistIds = new Set(ids);
     } catch (_) {}
     showPlaylists = true;
@@ -97,14 +109,16 @@
 
   function handleRemoveFromQueue() {
     if (!track) return;
-    const idx = player.queue.findIndex((t) => t.id === track!.id);
+    const idx = queuePosition !== undefined
+      ? (player.queue[queuePosition] === track ? queuePosition : -1)
+      : player.queue.findIndex((t) => t.id === track!.id);
     if (idx !== -1) player.removeFromQueue(idx);
     showToast("Removed from queue");
     close();
   }
 
   async function handleRemoveFromPlaylist() {
-    if (!track || nav.activePlaylistId === null) return;
+    if (readOnly || !track || nav.activePlaylistId === null) return;
     const removedId = track.id;
     try {
       await removeFromPlaylist(nav.activePlaylistId, removedId);
@@ -195,6 +209,7 @@
     onclick={(e) => e.stopPropagation()}
   >
     {#if !showPlaylists}
+      <button class="ctx-item" role="menuitem" onclick={handleRadio}>Start YouTube Music radio</button>
       <button class="ctx-item" role="menuitem" onclick={handlePlayNext}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/><line x1="22" y1="3" x2="22" y2="21"/></svg>
         Play next
@@ -228,7 +243,7 @@
             Remove from queue
           </button>
         {/if}
-        {#if inPlaylist}
+        {#if inPlaylist && !readOnly}
           <button class="ctx-item ctx-danger" role="menuitem" onclick={handleRemoveFromPlaylist}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
             Remove from playlist
